@@ -186,8 +186,34 @@ codex-dash keys
 codex-dash pick
 codex-dash resume <session-id-or-prefix>
 codex-dash attach <session-id-or-prefix>
+codex-dash sync <ssh-target>
+codex-dash watch --sync-target <ssh-target>
 codex-dash where
 ```
+
+## Live Refresh
+
+For near-immediate local updates, run a watcher on each machine:
+
+```sh
+codex-dash watch
+```
+
+The watcher polls only Codex's own state database and rollout files, debounces changes, refreshes the local board JSON, and writes a heartbeat even when nothing changes. It does not make the dashboard wait on remote machines.
+
+To also pool another installed machine over SSH:
+
+```sh
+codex-dash watch --sync-target arnabthinkpad
+```
+
+For a one-shot sync:
+
+```sh
+codex-dash sync arnabthinkpad
+```
+
+Repeat `--sync-target` or pass multiple targets to `sync` for more machines. Only `machines/*.json` and `sessions/*.json` are copied.
 
 ## Privacy
 

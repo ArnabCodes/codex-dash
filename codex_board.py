@@ -881,6 +881,113 @@ def refresh_export_quiet(limit: int = 500) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def codex_state_signature() -> tuple[int, int, int, int, int]:
+    """Return a cheap signature for Codex state changes.
+
+    The dashboard writes its own state under BOARD_HOME, which is usually inside
+    CODEX_HOME. Watching only the Codex database and rollout tree avoids a
+    refresh loop caused by our own exported JSON files changing.
+    """
+    db_path = CODEX_HOME / "state_5.sqlite"
+    db_mtime = 0
+    db_size = 0
+    try:
+        stat = db_path.stat()
+        db_mtime = stat.st_mtime_ns
+        db_size = stat.st_size
+    except OSError:
+        pass
+
+    count = 0
+    max_mtime = 0
+    total_size = 0
+    sessions_root = CODEX_HOME / "sessions"
+    if sessions_root.exists():
+        try:
+            iterator = sessions_root.rglob("*.jsonl")
+            for path in iterator:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                count += 1
+                max_mtime = max(max_mtime, stat.st_mtime_ns)
+                total_size += stat.st_size
+        except OSError:
+            pass
+    return db_mtime, db_size, count, max_mtime, total_size
+
+
+def run_external(command: list[str], quiet: bool = False) -> bool:
+    if not quiet:
+        print(" ".join(command), flush=True)
+    result = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        stdout=subprocess.DEVNULL if quiet else None,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0 and not quiet:
+        error = (result.stderr or "").strip()
+        if error:
+            print(error, file=sys.stderr)
+    return result.returncode == 0
+
+
+def sync_state_once(args: argparse.Namespace) -> bool:
+    targets = [str(target).strip() for target in getattr(args, "targets", []) if str(target).strip()]
+    if not targets:
+        raise SystemExit("At least one sync target is required.")
+
+    direction = str(getattr(args, "direction", "both") or "both")
+    remote_board_path = str(getattr(args, "remote_board_path", "~/.codex/instance-board") or "~/.codex/instance-board")
+    quiet = bool(getattr(args, "quiet", False))
+    limit = int(getattr(args, "limit", 500) or 500)
+    ok = True
+
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    MACHINES_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not getattr(args, "skip_local_refresh", False):
+        local_ok, error = refresh_export_quiet(limit)
+        ok = ok and local_ok
+        if error and not quiet:
+            print(f"Local refresh failed: {error}", file=sys.stderr)
+
+    for target in targets:
+        if not quiet:
+            print(f"Syncing {target}", flush=True)
+
+        if not getattr(args, "skip_remote_refresh", False):
+            remote_refresh = f"codex-dash refresh --quiet --limit {limit}"
+            remote_ok = run_external(["ssh", target, remote_refresh], quiet=quiet)
+            ok = ok and remote_ok
+
+        if direction in {"pull", "both"}:
+            pull_machines = run_external(
+                ["scp", "-q", f"{target}:{remote_board_path}/machines/*.json", str(MACHINES_DIR) + os.sep],
+                quiet=True,
+            )
+            pull_sessions = run_external(
+                ["scp", "-q", f"{target}:{remote_board_path}/sessions/*.json", str(SESSIONS_DIR) + os.sep],
+                quiet=True,
+            )
+            ok = ok and pull_machines and pull_sessions
+            if not quiet and not (pull_machines and pull_sessions):
+                print(f"Warning: could not pull all board files from {target}", file=sys.stderr)
+
+        if direction in {"push", "both"}:
+            machine_files = [str(path) for path in MACHINES_DIR.glob("*.json")]
+            session_files = [str(path) for path in SESSIONS_DIR.glob("*.json")]
+            if machine_files:
+                ok = run_external(["scp", "-q", *machine_files, f"{target}:{remote_board_path}/machines/"], quiet=True) and ok
+            if session_files:
+                ok = run_external(["scp", "-q", *session_files, f"{target}:{remote_board_path}/sessions/"], quiet=True) and ok
+
+    return ok
+
+
 def read_json_files(folder: Path) -> list[dict[str, Any]]:
     rows = []
     if not folder.exists():
@@ -3010,10 +3117,67 @@ def command_launch(args: argparse.Namespace) -> None:
     raise SystemExit(process.returncode)
 
 
+def command_sync(args: argparse.Namespace) -> None:
+    raise SystemExit(0 if sync_state_once(args) else 1)
+
+
 def command_watch(args: argparse.Namespace) -> None:
+    interval = max(1.0, float(getattr(args, "interval", 1.0) or 1.0))
+    debounce = max(0.1, float(getattr(args, "debounce", 0.75) or 0.75))
+    heartbeat = max(5.0, float(getattr(args, "heartbeat", 30.0) or 30.0))
+    sync_interval = max(0.0, float(getattr(args, "sync_interval", 10.0) or 0.0))
+    quiet = bool(getattr(args, "quiet", False))
+    targets = [str(target).strip() for target in getattr(args, "targets", []) if str(target).strip()]
+
+    last_signature: tuple[int, int, int, int, int] | None = None
+    pending_since: float | None = None
+    last_refresh = 0.0
+    last_sync = 0.0
+
+    def refresh(reason: str) -> None:
+        nonlocal last_refresh
+        ok, error = refresh_export_quiet(int(getattr(args, "limit", 500) or 500))
+        last_refresh = time.time()
+        if not quiet:
+            if ok:
+                print(f"{dt.datetime.now().strftime('%H:%M:%S')} refreshed ({reason})", flush=True)
+            else:
+                print(f"{dt.datetime.now().strftime('%H:%M:%S')} refresh failed: {error}", file=sys.stderr, flush=True)
+
+    refresh("startup")
+    last_signature = codex_state_signature()
+
     while True:
-        export_state(args)
-        time.sleep(args.interval)
+        now = time.time()
+        signature = codex_state_signature()
+        if signature != last_signature:
+            last_signature = signature
+            pending_since = now
+
+        if pending_since is not None and now - pending_since >= debounce:
+            refresh("codex state changed")
+            pending_since = None
+
+        if now - last_refresh >= heartbeat:
+            refresh("heartbeat")
+
+        if targets and sync_interval > 0 and now - last_sync >= sync_interval:
+            sync_args = argparse.Namespace(
+                targets=targets,
+                direction=getattr(args, "direction", "both"),
+                remote_board_path=getattr(args, "remote_board_path", "~/.codex/instance-board"),
+                skip_local_refresh=True,
+                skip_remote_refresh=getattr(args, "skip_remote_refresh", False),
+                limit=getattr(args, "limit", 500),
+                quiet=quiet,
+            )
+            synced = sync_state_once(sync_args)
+            last_sync = now
+            if not quiet:
+                label = "synced" if synced else "sync had errors"
+                print(f"{dt.datetime.now().strftime('%H:%M:%S')} {label}: {', '.join(targets)}", flush=True)
+
+        time.sleep(interval)
 
 
 def command_where(_: argparse.Namespace) -> None:
@@ -3099,9 +3263,27 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("command", nargs=argparse.REMAINDER, help="Command to run, usually after --")
     launch.set_defaults(func=command_launch)
 
-    watch = sub.add_parser("watch", help="Refresh repeatedly for cross-machine heartbeat")
-    watch.add_argument("--interval", type=int, default=60)
+    sync = sub.add_parser("sync", help="Refresh and sync pooled board JSON with other machines")
+    sync.add_argument("targets", nargs="+", help="SSH targets to sync with")
+    sync.add_argument("--direction", choices=["push", "pull", "both"], default="both")
+    sync.add_argument("--remote-board-path", default="~/.codex/instance-board")
+    sync.add_argument("--skip-local-refresh", action="store_true")
+    sync.add_argument("--skip-remote-refresh", action="store_true")
+    sync.add_argument("--limit", type=int, default=500)
+    sync.add_argument("--quiet", action="store_true")
+    sync.set_defaults(func=command_sync)
+
+    watch = sub.add_parser("watch", help="Watch local Codex state and optionally sync remote board JSON")
+    watch.add_argument("--interval", type=float, default=1.0, help="Polling interval for local Codex state")
+    watch.add_argument("--debounce", type=float, default=0.75, help="Delay after a file change before refreshing")
+    watch.add_argument("--heartbeat", type=float, default=30.0, help="Refresh at least this often, even without file changes")
     watch.add_argument("--limit", type=int, default=500)
+    watch.add_argument("--sync-target", dest="targets", action="append", default=[], help="SSH target to sync; repeat for multiple machines")
+    watch.add_argument("--sync-interval", type=float, default=10.0, help="Seconds between sync attempts when targets are configured")
+    watch.add_argument("--direction", choices=["push", "pull", "both"], default="both")
+    watch.add_argument("--remote-board-path", default="~/.codex/instance-board")
+    watch.add_argument("--skip-remote-refresh", action="store_true")
+    watch.add_argument("--quiet", action="store_true")
     watch.set_defaults(func=command_watch)
 
     where = sub.add_parser("where", help="Print paths and machine identity")
