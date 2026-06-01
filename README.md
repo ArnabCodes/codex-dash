@@ -244,6 +244,8 @@ Example:
   "peers": [
     {
       "target": "arnabthinkpad",
+      "local_codex_home": "C:/Users/arnab/.codex",
+      "local_board_path": "C:/Users/arnab/.codex/instance-board",
       "remote_codex_home": "C:/Users/Administrator/.codex",
       "remote_board_path": "C:/Users/Administrator/.codex/instance-board"
     }

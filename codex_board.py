@@ -984,6 +984,8 @@ def sync_peers_from_args(args: argparse.Namespace) -> list[dict[str, str]]:
                     "target": target,
                     "remote_board_path": str(getattr(args, "remote_board_path", "~/.codex/instance-board") or "~/.codex/instance-board"),
                     "remote_codex_home": str(getattr(args, "remote_codex_home", "") or ""),
+                    "local_board_path": str(getattr(args, "local_board_path", "") or ""),
+                    "local_codex_home": str(getattr(args, "local_codex_home", "") or ""),
                 }
             )
         return peers
@@ -1000,6 +1002,8 @@ def sync_peers_from_args(args: argparse.Namespace) -> list[dict[str, str]]:
                 "target": target,
                 "remote_board_path": str(peer.get("remote_board_path") or "~/.codex/instance-board"),
                 "remote_codex_home": str(peer.get("remote_codex_home") or ""),
+                "local_board_path": str(peer.get("local_board_path") or ""),
+                "local_codex_home": str(peer.get("local_codex_home") or ""),
             }
         )
     return peers
@@ -1015,11 +1019,32 @@ def sync_state_once(args: argparse.Namespace) -> bool:
     limit = int(getattr(args, "limit", 500) or 500)
     ok = True
 
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    MACHINES_DIR.mkdir(parents=True, exist_ok=True)
+    local_board_path = next((peer["local_board_path"] for peer in peers if peer.get("local_board_path")), "")
+    local_codex_home = next((peer["local_codex_home"] for peer in peers if peer.get("local_codex_home")), "")
+    board_home = Path(local_board_path).expanduser() if local_board_path else BOARD_HOME
+    sessions_dir = board_home / "sessions"
+    machines_dir = board_home / "machines"
+
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    machines_dir.mkdir(parents=True, exist_ok=True)
+
+    if local_board_path:
+        os.environ["CODEX_BOARD_HOME"] = local_board_path
+    if local_codex_home:
+        os.environ["CODEX_HOME"] = local_codex_home
 
     if not getattr(args, "skip_local_refresh", False):
-        local_ok, error = refresh_export_quiet(limit)
+        if local_board_path or local_codex_home:
+            command = [sys.executable, str(Path(__file__).resolve()), "refresh", "--quiet", "--limit", str(limit)]
+            env = os.environ.copy()
+            if local_board_path:
+                env["CODEX_BOARD_HOME"] = local_board_path
+            if local_codex_home:
+                env["CODEX_HOME"] = local_codex_home
+            result = subprocess.run(command, check=False, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
+            local_ok, error = result.returncode == 0, (result.stderr or "").strip()
+        else:
+            local_ok, error = refresh_export_quiet(limit)
         ok = ok and local_ok
         if error and not quiet:
             print(f"Local refresh failed: {error}", file=sys.stderr)
@@ -1040,11 +1065,11 @@ def sync_state_once(args: argparse.Namespace) -> bool:
 
         if direction in {"pull", "both"}:
             pull_machines = run_external(
-                ["scp", "-q", f"{target}:{remote_board_path}/machines/*.json", str(MACHINES_DIR) + os.sep],
+                ["scp", "-q", f"{target}:{remote_board_path}/machines/*.json", str(machines_dir) + os.sep],
                 quiet=True,
             )
             pull_sessions = run_external(
-                ["scp", "-q", f"{target}:{remote_board_path}/sessions/*.json", str(SESSIONS_DIR) + os.sep],
+                ["scp", "-q", f"{target}:{remote_board_path}/sessions/*.json", str(sessions_dir) + os.sep],
                 quiet=True,
             )
             ok = ok and pull_machines and pull_sessions
@@ -1052,8 +1077,8 @@ def sync_state_once(args: argparse.Namespace) -> bool:
                 print(f"Warning: could not pull all board files from {target}", file=sys.stderr)
 
         if direction in {"push", "both"}:
-            machine_files = [str(path) for path in MACHINES_DIR.glob("*.json")]
-            session_files = [str(path) for path in SESSIONS_DIR.glob("*.json")]
+            machine_files = [str(path) for path in machines_dir.glob("*.json")]
+            session_files = [str(path) for path in sessions_dir.glob("*.json")]
             if machine_files:
                 ok = run_external(["scp", "-q", *machine_files, f"{target}:{remote_board_path}/machines/"], quiet=True) and ok
             if session_files:
@@ -3242,6 +3267,8 @@ def command_watch(args: argparse.Namespace) -> None:
                 direction=getattr(args, "direction", "both"),
                 remote_board_path=getattr(args, "remote_board_path", "~/.codex/instance-board"),
                 remote_codex_home=getattr(args, "remote_codex_home", ""),
+                local_board_path=getattr(args, "local_board_path", ""),
+                local_codex_home=getattr(args, "local_codex_home", ""),
                 skip_local_refresh=True,
                 skip_remote_refresh=getattr(args, "skip_remote_refresh", False),
                 limit=getattr(args, "limit", 500),
@@ -3346,6 +3373,8 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--direction", choices=["push", "pull", "both"], default="both")
     sync.add_argument("--remote-board-path", default="~/.codex/instance-board")
     sync.add_argument("--remote-codex-home", default="", help="CODEX_HOME to use during remote refresh")
+    sync.add_argument("--local-board-path", default="", help="Local board path to read/write during sync")
+    sync.add_argument("--local-codex-home", default="", help="Local CODEX_HOME to use during sync refresh")
     sync.add_argument("--skip-local-refresh", action="store_true")
     sync.add_argument("--skip-remote-refresh", action="store_true")
     sync.add_argument("--limit", type=int, default=500)
@@ -3362,6 +3391,8 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--direction", choices=["push", "pull", "both"], default="both")
     watch.add_argument("--remote-board-path", default="~/.codex/instance-board")
     watch.add_argument("--remote-codex-home", default="", help="CODEX_HOME to use during remote refresh")
+    watch.add_argument("--local-board-path", default="", help="Local board path to read/write during sync")
+    watch.add_argument("--local-codex-home", default="", help="Local CODEX_HOME to use during sync refresh")
     watch.add_argument("--skip-remote-refresh", action="store_true")
     watch.add_argument("--quiet", action="store_true")
     watch.set_defaults(func=command_watch)
