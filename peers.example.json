@@ -1,0 +1,9 @@
+{
+  "peers": [
+    {
+      "target": "arnabthinkpad",
+      "remote_codex_home": "C:/Users/arnab/.codex",
+      "remote_board_path": "C:/Users/arnab/.codex/instance-board"
+    }
+  ]
+}

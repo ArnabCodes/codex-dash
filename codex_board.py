@@ -28,6 +28,7 @@ ASSIGNMENTS_PATH = BOARD_HOME / "assignments.json"
 SUMMARIES_PATH = BOARD_HOME / "summaries.json"
 PROJECTS_DIR = BOARD_HOME / "projects"
 LAUNCHES_PATH = BOARD_HOME / "launches.json"
+PEERS_PATH = BOARD_HOME / "peers.json"
 RECENT_SECONDS = 7 * 24 * 60 * 60
 HEARTBEAT_SECONDS = 120
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -209,6 +210,20 @@ def load_launches() -> dict[str, Any]:
 def save_launches(data: dict[str, Any]) -> None:
     LAUNCHES_PATH.parent.mkdir(parents=True, exist_ok=True)
     LAUNCHES_PATH.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def load_peers() -> dict[str, Any]:
+    if not PEERS_PATH.exists():
+        return {"peers": []}
+    try:
+        data = json.loads(PEERS_PATH.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {"peers": []}
+    if not isinstance(data, dict):
+        return {"peers": []}
+    peers = data.get("peers")
+    data["peers"] = peers if isinstance(peers, list) else []
+    return data
 
 
 def detect_launch_origin(args: argparse.Namespace | None = None) -> dict[str, str]:
@@ -935,13 +950,67 @@ def run_external(command: list[str], quiet: bool = False) -> bool:
     return result.returncode == 0
 
 
-def sync_state_once(args: argparse.Namespace) -> bool:
+def ps_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def remote_refresh_command(limit: int, remote_board_path: str, remote_codex_home: str) -> str:
+    statements = []
+    if remote_board_path:
+        statements.append(f"$env:CODEX_BOARD_HOME={ps_single_quote(remote_board_path)}")
+    if remote_codex_home:
+        statements.append(f"$env:CODEX_HOME={ps_single_quote(remote_codex_home)}")
+    statements.append(f"codex-dash refresh --quiet --limit {int(limit)}")
+    command = "; ".join(statements)
+    return f"powershell -NoProfile -ExecutionPolicy Bypass -Command {json.dumps(command)}"
+
+
+def remote_mkdir_command(remote_board_path: str) -> str:
+    command = (
+        "New-Item -ItemType Directory -Force "
+        f"-Path {ps_single_quote(remote_board_path + '/machines')},{ps_single_quote(remote_board_path + '/sessions')} "
+        "| Out-Null"
+    )
+    return f"powershell -NoProfile -ExecutionPolicy Bypass -Command {json.dumps(command)}"
+
+
+def sync_peers_from_args(args: argparse.Namespace) -> list[dict[str, str]]:
     targets = [str(target).strip() for target in getattr(args, "targets", []) if str(target).strip()]
-    if not targets:
-        raise SystemExit("At least one sync target is required.")
+    peers = []
+    if targets:
+        for target in targets:
+            peers.append(
+                {
+                    "target": target,
+                    "remote_board_path": str(getattr(args, "remote_board_path", "~/.codex/instance-board") or "~/.codex/instance-board"),
+                    "remote_codex_home": str(getattr(args, "remote_codex_home", "") or ""),
+                }
+            )
+        return peers
+
+    configured = load_peers().get("peers", [])
+    for peer in configured:
+        if not isinstance(peer, dict):
+            continue
+        target = str(peer.get("target") or peer.get("host") or "").strip()
+        if not target:
+            continue
+        peers.append(
+            {
+                "target": target,
+                "remote_board_path": str(peer.get("remote_board_path") or "~/.codex/instance-board"),
+                "remote_codex_home": str(peer.get("remote_codex_home") or ""),
+            }
+        )
+    return peers
+
+
+def sync_state_once(args: argparse.Namespace) -> bool:
+    peers = sync_peers_from_args(args)
+    if not peers:
+        raise SystemExit(f"At least one sync target is required, or configure {PEERS_PATH}.")
 
     direction = str(getattr(args, "direction", "both") or "both")
-    remote_board_path = str(getattr(args, "remote_board_path", "~/.codex/instance-board") or "~/.codex/instance-board")
     quiet = bool(getattr(args, "quiet", False))
     limit = int(getattr(args, "limit", 500) or 500)
     ok = True
@@ -955,12 +1024,17 @@ def sync_state_once(args: argparse.Namespace) -> bool:
         if error and not quiet:
             print(f"Local refresh failed: {error}", file=sys.stderr)
 
-    for target in targets:
+    for peer in peers:
+        target = peer["target"]
+        remote_board_path = peer["remote_board_path"]
+        remote_codex_home = peer["remote_codex_home"]
         if not quiet:
             print(f"Syncing {target}", flush=True)
 
+        ok = run_external(["ssh", target, remote_mkdir_command(remote_board_path)], quiet=quiet) and ok
+
         if not getattr(args, "skip_remote_refresh", False):
-            remote_refresh = f"codex-dash refresh --quiet --limit {limit}"
+            remote_refresh = remote_refresh_command(limit, remote_board_path, remote_codex_home)
             remote_ok = run_external(["ssh", target, remote_refresh], quiet=quiet)
             ok = ok and remote_ok
 
@@ -3128,6 +3202,7 @@ def command_watch(args: argparse.Namespace) -> None:
     sync_interval = max(0.0, float(getattr(args, "sync_interval", 10.0) or 0.0))
     quiet = bool(getattr(args, "quiet", False))
     targets = [str(target).strip() for target in getattr(args, "targets", []) if str(target).strip()]
+    configured_peers = sync_peers_from_args(args)
 
     last_signature: tuple[int, int, int, int, int] | None = None
     pending_since: float | None = None
@@ -3161,11 +3236,12 @@ def command_watch(args: argparse.Namespace) -> None:
         if now - last_refresh >= heartbeat:
             refresh("heartbeat")
 
-        if targets and sync_interval > 0 and now - last_sync >= sync_interval:
+        if configured_peers and sync_interval > 0 and now - last_sync >= sync_interval:
             sync_args = argparse.Namespace(
                 targets=targets,
                 direction=getattr(args, "direction", "both"),
                 remote_board_path=getattr(args, "remote_board_path", "~/.codex/instance-board"),
+                remote_codex_home=getattr(args, "remote_codex_home", ""),
                 skip_local_refresh=True,
                 skip_remote_refresh=getattr(args, "skip_remote_refresh", False),
                 limit=getattr(args, "limit", 500),
@@ -3174,8 +3250,9 @@ def command_watch(args: argparse.Namespace) -> None:
             synced = sync_state_once(sync_args)
             last_sync = now
             if not quiet:
+                peer_labels = [peer["target"] for peer in configured_peers]
                 label = "synced" if synced else "sync had errors"
-                print(f"{dt.datetime.now().strftime('%H:%M:%S')} {label}: {', '.join(targets)}", flush=True)
+                print(f"{dt.datetime.now().strftime('%H:%M:%S')} {label}: {', '.join(peer_labels)}", flush=True)
 
         time.sleep(interval)
 
@@ -3184,6 +3261,7 @@ def command_where(_: argparse.Namespace) -> None:
     print(f"BOARD_HOME={BOARD_HOME}")
     print(f"CODEX_HOME={CODEX_HOME}")
     print(f"MANIFEST={MANIFEST_PATH}")
+    print(f"PEERS={PEERS_PATH}")
     print(f"MACHINE_ID={machine_id()}")
     account = load_current_account()
     print(f"ACCOUNT={account.get('label')}")
@@ -3264,9 +3342,10 @@ def build_parser() -> argparse.ArgumentParser:
     launch.set_defaults(func=command_launch)
 
     sync = sub.add_parser("sync", help="Refresh and sync pooled board JSON with other machines")
-    sync.add_argument("targets", nargs="+", help="SSH targets to sync with")
+    sync.add_argument("targets", nargs="*", help="SSH targets to sync with; defaults to peers.json")
     sync.add_argument("--direction", choices=["push", "pull", "both"], default="both")
     sync.add_argument("--remote-board-path", default="~/.codex/instance-board")
+    sync.add_argument("--remote-codex-home", default="", help="CODEX_HOME to use during remote refresh")
     sync.add_argument("--skip-local-refresh", action="store_true")
     sync.add_argument("--skip-remote-refresh", action="store_true")
     sync.add_argument("--limit", type=int, default=500)
@@ -3282,6 +3361,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--sync-interval", type=float, default=10.0, help="Seconds between sync attempts when targets are configured")
     watch.add_argument("--direction", choices=["push", "pull", "both"], default="both")
     watch.add_argument("--remote-board-path", default="~/.codex/instance-board")
+    watch.add_argument("--remote-codex-home", default="", help="CODEX_HOME to use during remote refresh")
     watch.add_argument("--skip-remote-refresh", action="store_true")
     watch.add_argument("--quiet", action="store_true")
     watch.set_defaults(func=command_watch)

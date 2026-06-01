@@ -18,6 +18,7 @@ summaries.json
 assignments.json
 launches.json
 projects.yaml
+peers.json
 
 # Local packaging/editor state.
 .idea/
