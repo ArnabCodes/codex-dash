@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+.venv/
+venv/
+
+# Local Codex board state. These files can contain private paths,
+# prompts, summaries, account labels, and machine names.
+machines/
+sessions/
+projects/
+summaries.json
+assignments.json
+launches.json
+projects.yaml
+
+# Local packaging/editor state.
+.idea/
+.vscode/
+*.log

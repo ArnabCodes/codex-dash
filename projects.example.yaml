@@ -1,0 +1,9 @@
+projects:
+  - id: example
+    name: Example Project
+    roots:
+      - C:\path\to\project
+    subprojects:
+      - id: default
+        name: Default
+        cwd: C:\path\to\project
