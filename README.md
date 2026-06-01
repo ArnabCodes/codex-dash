@@ -199,7 +199,7 @@ For near-immediate local updates, run a watcher on each machine:
 codex-dash watch
 ```
 
-The watcher polls only Codex's own state database and rollout files, debounces changes, refreshes the local board JSON, and writes a heartbeat even when nothing changes. It does not make the dashboard wait on remote machines.
+The watcher polls only Codex's own state database and rollout files, debounces changes, refreshes the local board JSON, and writes a heartbeat every few seconds even when nothing changes. It does not make the dashboard wait on remote machines.
 
 To also pool another installed machine over SSH:
 

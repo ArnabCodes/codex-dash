@@ -3124,7 +3124,7 @@ def command_sync(args: argparse.Namespace) -> None:
 def command_watch(args: argparse.Namespace) -> None:
     interval = max(1.0, float(getattr(args, "interval", 1.0) or 1.0))
     debounce = max(0.1, float(getattr(args, "debounce", 0.75) or 0.75))
-    heartbeat = max(5.0, float(getattr(args, "heartbeat", 30.0) or 30.0))
+    heartbeat = max(2.0, float(getattr(args, "heartbeat", 5.0) or 5.0))
     sync_interval = max(0.0, float(getattr(args, "sync_interval", 10.0) or 0.0))
     quiet = bool(getattr(args, "quiet", False))
     targets = [str(target).strip() for target in getattr(args, "targets", []) if str(target).strip()]
@@ -3276,7 +3276,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch = sub.add_parser("watch", help="Watch local Codex state and optionally sync remote board JSON")
     watch.add_argument("--interval", type=float, default=1.0, help="Polling interval for local Codex state")
     watch.add_argument("--debounce", type=float, default=0.75, help="Delay after a file change before refreshing")
-    watch.add_argument("--heartbeat", type=float, default=30.0, help="Refresh at least this often, even without file changes")
+    watch.add_argument("--heartbeat", type=float, default=5.0, help="Refresh at least this often, even without file changes")
     watch.add_argument("--limit", type=int, default=500)
     watch.add_argument("--sync-target", dest="targets", action="append", default=[], help="SSH target to sync; repeat for multiple machines")
     watch.add_argument("--sync-interval", type=float, default=10.0, help="Seconds between sync attempts when targets are configured")
