@@ -211,8 +211,8 @@ If SSH logs into a different account than the desktop user running Codex, pin th
 
 ```sh
 codex-dash watch --sync-target arnabthinkpad \
-  --remote-codex-home C:/Users/arnab/.codex \
-  --remote-board-path C:/Users/arnab/.codex/instance-board
+  --remote-codex-home C:/Users/Administrator/.codex \
+  --remote-board-path C:/Users/Administrator/.codex/instance-board
 ```
 
 For a one-shot sync:
@@ -225,8 +225,8 @@ With explicit remote paths:
 
 ```sh
 codex-dash sync arnabthinkpad \
-  --remote-codex-home C:/Users/arnab/.codex \
-  --remote-board-path C:/Users/arnab/.codex/instance-board
+  --remote-codex-home C:/Users/Administrator/.codex \
+  --remote-board-path C:/Users/Administrator/.codex/instance-board
 ```
 
 Repeat `--sync-target` or pass multiple targets to `sync` for more machines. Only `machines/*.json` and `sessions/*.json` are copied.
@@ -244,8 +244,8 @@ Example:
   "peers": [
     {
       "target": "arnabthinkpad",
-      "remote_codex_home": "C:/Users/arnab/.codex",
-      "remote_board_path": "C:/Users/arnab/.codex/instance-board"
+      "remote_codex_home": "C:/Users/Administrator/.codex",
+      "remote_board_path": "C:/Users/Administrator/.codex/instance-board"
     }
   ]
 }
