@@ -3258,6 +3258,33 @@ class AnsiDashboardApp:
         raw = animate_pair("â–ˆ", "â–‘", raw)
         return raw
 
+    def colorized_usage_line(self, raw: str, color: str, accent: str) -> str:
+        if raw.startswith(("╭", "╰", "â•­", "â•°")):
+            return self.color(raw, color)
+        muted = "38;2;88;96;108"
+        bar_pairs = {
+            "━": "─",
+            "█": "░",
+            "â”": "â”€",
+            "â–ˆ": "â–‘",
+            "Ã¢â€Â": "Ã¢â€â‚¬",
+            "Ã¢â€“Ë†": "Ã¢â€“â€˜",
+        }
+        singles = {glyph for pair in bar_pairs.items() for glyph in pair}
+        pattern = re.compile("|".join(re.escape(glyph) for glyph in sorted(singles, key=len, reverse=True)))
+        parts: list[str] = []
+        index = 0
+        for match in pattern.finditer(raw):
+            if match.start() > index:
+                parts.append(self.color(raw[index : match.start()], color))
+            glyph = match.group(0)
+            is_filled = glyph in bar_pairs
+            parts.append(self.color("━", accent if is_filled else muted))
+            index = match.end()
+        if index < len(raw):
+            parts.append(self.color(raw[index:], color))
+        return "".join(parts) if parts else self.color(raw, color)
+
     def usage_content_rows(self, body_width: int) -> list[str]:
         inner_width = max(1, body_width - 4)
         if self.usage_rows:
@@ -3314,7 +3341,8 @@ class AnsiDashboardApp:
             color = usage_color(raw, heading=is_heading, rule=is_rule)
             if is_rule:
                 raw = "─" * inner_width
-            rows.append(self.pane_row(self.color(raw, color), body_width, "38;2;126;203;255"))
+            content = self.color(raw, color) if is_rule else self.colorized_usage_line(raw, color, section_color)
+            rows.append(self.pane_row(content, body_width, "38;2;126;203;255"))
         return rows
 
     def render_usage_overlay(self) -> str:
