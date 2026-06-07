@@ -6,7 +6,6 @@ import base64
 import datetime as dt
 import gzip
 import json
-import math
 import os
 import platform
 import re
@@ -2341,8 +2340,6 @@ class AnsiDashboardApp:
         self.usage_thread: threading.Thread | None = None
         self.usage_width = 0
         self.usage_cached_at = ""
-        self.usage_animation_started = 0.0
-        self.usage_animation_duration = 1.15
         self.search_mode = False
         self.search_buffer = ""
         self.command_mode = False
@@ -3234,51 +3231,13 @@ class AnsiDashboardApp:
         self.usage_cached_at = str(cached.get("updated_at") or "")
         return True
 
-    def animated_usage_line(self, raw: str) -> str:
-        if not self.usage_animation_started:
-            return raw
-        elapsed = time.time() - self.usage_animation_started
-        progress = min(1.0, max(0.0, elapsed / self.usage_animation_duration))
-        if progress >= 1.0:
-            return raw
-        spring = 1.0 - (math.exp(-6.0 * progress) * math.cos(11.0 * progress))
-        spring = max(0.0, min(1.08, spring))
-
-        def animate_pair(filled: str, empty: str, partial: str, text: str) -> str:
-            pattern = re.compile(f"([{re.escape(filled + empty + partial)}]{{4,18}})")
-
-            def replace(match: re.Match[str]) -> str:
-                segment = match.group(1)
-                width = len(segment)
-                target_units = segment.count(filled) * 2 + segment.count(partial)
-                shown_units = min(width * 2, max(0, int(round(target_units * spring))))
-                full = shown_units // 2
-                has_partial = shown_units % 2
-                empty_count = max(0, width - full - has_partial)
-                return filled * full + (partial if has_partial else "") + empty * empty_count
-
-            return pattern.sub(replace, text)
-
-        raw = animate_pair("━", "─", "╸", raw)
-        raw = animate_pair("█", "░", "▌", raw)
-        raw = animate_pair("â”", "â”€", "â•¸", raw)
-        raw = animate_pair("â–ˆ", "â–‘", "â–Œ", raw)
-        return raw
-
     def colorized_usage_line(self, raw: str, color: str, accent: str) -> str:
         if raw.startswith(("╭", "╰", "â•­", "â•°")):
             return self.color(raw, color)
         muted = "38;2;88;96;108"
         bar_pairs = {
-            "━": "─",
-            "╸": "─",
             "█": "░",
-            "▌": "░",
-            "â”": "â”€",
-            "â•¸": "â”€",
             "â–ˆ": "â–‘",
-            "â–Œ": "â–‘",
-            "Ã¢â€Â": "Ã¢â€â‚¬",
             "Ã¢â€“Ë†": "Ã¢â€“â€˜",
         }
         singles = {glyph for pair in bar_pairs.items() for glyph in pair}
@@ -3290,7 +3249,7 @@ class AnsiDashboardApp:
                 parts.append(self.color(raw[index : match.start()], color))
             glyph = match.group(0)
             is_filled = glyph in bar_pairs
-            parts.append(self.color("╸" if glyph in {"╸", "â•¸"} else "─", accent if is_filled else muted))
+            parts.append(self.color("█", accent if is_filled else muted))
             index = match.end()
         if index < len(raw):
             parts.append(self.color(raw[index:], color))
@@ -3342,7 +3301,6 @@ class AnsiDashboardApp:
             return "38;2;220;224;232"
 
         for index, raw in enumerate(raw_rows):
-            raw = self.animated_usage_line(raw)
             if not raw:
                 rows.append(self.pane_row("", body_width, "38;2;126;203;255"))
                 continue
@@ -3362,8 +3320,7 @@ class AnsiDashboardApp:
         if not self.usage_rows and not self.usage_loading:
             self.load_cached_usage_rows(content_width)
         if self.usage_rows and self.usage_width != content_width and not self.usage_loading:
-            if self.load_cached_usage_rows(content_width):
-                self.usage_animation_started = time.time()
+            self.load_cached_usage_rows(content_width)
             if self.usage_width != content_width:
                 self.start_usage_refresh()
         rows = self.usage_content_rows(body_width)
@@ -3381,7 +3338,6 @@ class AnsiDashboardApp:
         if not self.usage_rows:
             self.load_cached_usage_rows(content_width)
             self.usage_top = 0
-        self.usage_animation_started = time.time()
 
         def worker() -> None:
             try:
@@ -3393,7 +3349,6 @@ class AnsiDashboardApp:
                     lines.extend(["", f"Skipped {len(errors)} local source(s). Run codex-dash usage --show-errors for details."])
                 self.usage_rows = lines or ["No usage stats returned."]
                 self.usage_cached_at = now_utc()
-                self.usage_animation_started = time.time()
             except Exception as exc:
                 self.usage_error = str(exc)
             finally:
@@ -3408,8 +3363,7 @@ class AnsiDashboardApp:
         body_width, _ = self.modal_dimensions(preferred_width=82)
         content_width = max(32, body_width - 4)
         if not self.usage_rows:
-            if self.load_cached_usage_rows(content_width):
-                self.usage_animation_started = time.time()
+            self.load_cached_usage_rows(content_width)
         if refresh or not self.usage_loading:
             self.start_usage_refresh()
 
@@ -4489,13 +4443,10 @@ USAGE_BAR_WIDTH = 10
 
 def usage_bar(value: float, maximum: float, width: int = USAGE_BAR_WIDTH) -> str:
     if maximum <= 0:
-        units = 0
+        filled = 0
     else:
-        units = max(0, min(width * 2, int(round((value / maximum) * width * 2))))
-    filled = units // 2
-    partial = units % 2
-    empty = max(0, width - filled - partial)
-    return "━" * filled + ("╸" if partial else "") + "─" * empty
+        filled = max(0, min(width, int(round((value / maximum) * width))))
+    return "█" * filled + "░" * (width - filled)
 
 
 def clip_usage_cell(text: str, width: int) -> str:
@@ -4527,8 +4478,8 @@ def render_usage_columns(title: str, left_rows: list[str], right_rows: list[str]
     return rows
 
 
-def usage_metric_row(label: str, value: float, maximum: float, suffix: str = "", detail: str = "") -> str:
-    text = f"{label:<14.14} {format_metric(value, suffix):>8} {usage_bar(value, maximum)}"
+def usage_value_row(label: str, value: str, detail: str = "") -> str:
+    text = f"{label:<14.14} {value:>8}"
     if detail:
         text += f" {detail}"
     return text
@@ -4652,13 +4603,6 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
     cache_ratio = (all_totals["cached_input_tokens"] / all_totals["input_tokens"] * 100) if all_totals["input_tokens"] else 0.0
     output_ratio = (all_totals["output_tokens"] / all_totals["input_tokens"] * 100) if all_totals["input_tokens"] else 0.0
     reasoning_ratio = (all_totals["reasoning_output_tokens"] / all_totals["output_tokens"] * 100) if all_totals["output_tokens"] else 0.0
-    token_max = max(
-        all_totals["input_tokens"],
-        all_totals["cached_input_tokens"],
-        all_totals["output_tokens"],
-        all_totals["reasoning_output_tokens"],
-        1,
-    )
     token_mix = [
         ("Input", format_metric(all_totals["input_tokens"])),
         ("Cached input", f"{format_metric(all_totals['cached_input_tokens'])} ({cache_ratio:.1f}%)"),
@@ -4688,28 +4632,25 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
     ]
     useful_right = [
         usage_signal_row("󰯲 Avg context", f"{all_totals['avg_context_used_percent']:.1f}%", all_totals["avg_context_used_percent"], 100),
-        f"󱎫 Peak context  {float(max_context_session.get('context_used_percent') or 0):.1f}% {str(max_context_session.get('project_id') or 'n/a')[:8]}",
-        f"󰍛 Rate pressure {float(max_rate_session.get('rate_used_percent') or 0):.1f}% {str(max_rate_session.get('rate_plan_type') or 'n/a')[:8]}",
+        usage_signal_row("󱎫 Peak ctx", f"{float(max_context_session.get('context_used_percent') or 0):.1f}%", float(max_context_session.get("context_used_percent") or 0), 100, detail=str(max_context_session.get("project_id") or "n/a")[:8]),
+        usage_signal_row("󰍛 Rate press", f"{float(max_rate_session.get('rate_used_percent') or 0):.1f}%", float(max_rate_session.get("rate_used_percent") or 0), 100, detail=str(max_rate_session.get("rate_plan_type") or "n/a")[:8]),
     ]
 
     period_left = [row for card in period_cards[0::2] for row in card]
     period_right = [row for card in period_cards[1::2] for row in card]
     token_left = [
-        usage_metric_row("󰋊 Input       ", all_totals["input_tokens"], token_max),
-        usage_metric_row("󰄬 Cached      ", all_totals["cached_input_tokens"], token_max, detail=f"{cache_ratio:.1f}%"),
-        usage_metric_row("󰈸 Output      ", all_totals["output_tokens"], token_max),
+        usage_value_row("󰋊 Input", format_metric(all_totals["input_tokens"])),
+        usage_value_row("󰄬 Cached", format_metric(all_totals["cached_input_tokens"]), detail=f"{cache_ratio:.1f}% of input"),
+        usage_value_row("󰈸 Output", format_metric(all_totals["output_tokens"])),
     ]
     token_right = [
-        usage_metric_row("󰅟 Reasoning   ", all_totals["reasoning_output_tokens"], token_max),
-        usage_metric_row("󰓅 Last turn   ", all_totals["last_tokens"], max(all_totals["last_tokens"], all_totals["total_tokens"] / max(len(sessions), 1), 1)),
+        usage_value_row("󰅟 Reasoning", format_metric(all_totals["reasoning_output_tokens"]), detail=f"{reasoning_ratio:.1f}% of output"),
+        usage_value_row("󰓅 Last turn", format_metric(all_totals["last_tokens"])),
         f"󰹾 Indexed      {int(all_totals['active_sessions'])}/{int(all_totals['sessions'])} sessions",
     ]
-    project_max = max((value for _, value in top_projects), default=1)
-    model_max = max((value for _, value in top_models), default=1)
-    machine_max = max((value for _, value in top_machines), default=1)
-    project_rows = [usage_metric_row(f"󰏗 {label:<10}"[:14], value, project_max) for label, value in top_projects[:top]]
-    model_rows = [usage_metric_row(f"󰚩 {label:<10}"[:14], value, model_max) for label, value in top_models[:top]]
-    machine_rows = [usage_metric_row(f" {label:<10}"[:14], value, machine_max) for label, value in top_machines[:top]]
+    project_rows = [usage_value_row(f"󰏗 {label:<10}"[:14], format_metric(value)) for label, value in top_projects[:top]]
+    model_rows = [usage_value_row(f"󰚩 {label:<10}"[:14], format_metric(value)) for label, value in top_models[:top]]
+    machine_rows = [usage_value_row(f" {label:<10}"[:14], format_metric(value)) for label, value in top_machines[:top]]
     recent_rows = [f"󰈙 {label:<22} {value}" for label, value in recent_sessions[:top]]
 
     lines = [
