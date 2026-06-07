@@ -14,9 +14,18 @@ if (-not (Test-Path -LiteralPath $Script)) {
   throw "codex_board.py not found in $BoardHome"
 }
 
-$Python = Get-Command python -ErrorAction SilentlyContinue
+$PythonCommand = Get-Command python -ErrorAction SilentlyContinue
+$Python = if ($PythonCommand) { $PythonCommand.Source } else { "" }
 if (-not $Python) {
-  throw "python was not found on PATH. Install Python or add it to PATH first."
+  $Candidates = @(
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python310\python.exe")
+  )
+  $Python = ($Candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+if (-not $Python) {
+  throw "python was not found on PATH or in the standard per-user install locations."
 }
 
 New-Item -ItemType Directory -Force -Path $CommandDir | Out-Null
@@ -27,12 +36,12 @@ $Cmd = Join-Path $CommandDir "codex-dash.cmd"
 @"
 `$ErrorActionPreference = "Stop"
 `$Script = "$Script"
-python "`$Script" @args
+& "$Python" "`$Script" @args
 "@ | Set-Content -LiteralPath $Ps1 -Encoding UTF8
 
 @"
 @echo off
-python "$Script" %*
+"$Python" "$Script" %*
 "@ | Set-Content -LiteralPath $Cmd -Encoding ASCII
 
 if ($SetBoardHome) {

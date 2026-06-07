@@ -99,7 +99,8 @@ Common keys:
 - `o`: open/attach selected SSH or tmux session when metadata exists
 - `Enter`: resume selected session
 - `?`: show key overlay
-- `q` / `Esc`: quit
+- `Esc`: go back, close search/help, or clear active filters
+- `q`: quit
 
 Mouse support:
 
@@ -145,6 +146,18 @@ Project context Markdown files live under:
 ```text
 ~/.codex/instance-board/projects/
 ```
+
+## Local Usage Dashboard
+
+`codex-dash` can also show local Codex usage stats from the `.codex` folder, the instance-board session exports, and local dashboard log databases.
+
+Run:
+
+```sh
+codex-dash usage
+```
+
+The usage dashboard shows a two-column visual summary with token totals for sessions updated today, this week, this month, and all indexed sessions. It also shows token mix, cache efficiency, context/rate pressure, top projects, top models, top machines, recent sessions, local thread totals, and log volume. Use `--json` for machine-readable output or `--show-errors` to see local sources that could not be read.
 
 ## Multi-Machine Pooling
 
@@ -199,7 +212,7 @@ For near-immediate local updates, run a watcher on each machine:
 codex-dash watch
 ```
 
-The watcher polls only Codex's own state database and rollout files, debounces changes, refreshes the local board JSON, and writes a heartbeat every few seconds even when nothing changes. It does not make the dashboard wait on remote machines.
+The watcher polls only Codex's own state database and rollout files every 200ms, debounces changes for about 150ms, refreshes the local board JSON, and writes a heartbeat every few seconds even when nothing changes. When peers are configured, changed local state is synced immediately; periodic sync remains as a fallback. The dashboard itself also watches the exported board JSON and reloads as soon as those files change, so it does not wait for the slower fallback refresh timer.
 
 To also pool another installed machine over SSH:
 

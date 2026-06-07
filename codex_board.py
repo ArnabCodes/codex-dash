@@ -12,6 +12,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import textwrap
 from pathlib import Path
@@ -31,6 +32,16 @@ LAUNCHES_PATH = BOARD_HOME / "launches.json"
 PEERS_PATH = BOARD_HOME / "peers.json"
 RECENT_SECONDS = 7 * 24 * 60 * 60
 HEARTBEAT_SECONDS = 120
+TEMPERATURE_REFRESH_SECONDS = 30
+LHM_WINGET_PACKAGE = (
+    Path.home()
+    / "AppData"
+    / "Local"
+    / "Microsoft"
+    / "WinGet"
+    / "Packages"
+    / "LibreHardwareMonitor.LibreHardwareMonitor_Microsoft.Winget.Source_8wekyb3d8bbwe"
+)
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 if platform.system().lower() == "windows":
@@ -50,6 +61,54 @@ def machine_id() -> str:
     if configured:
         return configured
     return socket.gethostname().lower()
+
+
+def lhm_temperature_command() -> list[str] | None:
+    if platform.system().lower() != "windows":
+        return None
+    library_path = Path(os.environ.get("LIBRE_HARDWARE_MONITOR_LIB", LHM_WINGET_PACKAGE / "LibreHardwareMonitorLib.dll"))
+    if not library_path.exists():
+        return None
+    package_path = library_path.parent
+    script = rf"""
+$ErrorActionPreference = 'Stop'
+Set-Location '{package_path}'
+Add-Type -Path '{library_path}'
+$computer = New-Object LibreHardwareMonitor.Hardware.Computer
+$computer.IsCpuEnabled = $true
+$computer.IsGpuEnabled = $true
+$computer.Open()
+Start-Sleep -Milliseconds 800
+function Read-Sensors($Hardware) {{
+    $Hardware.Update()
+    foreach ($sensor in $Hardware.Sensors) {{
+        if ($sensor.SensorType -eq [LibreHardwareMonitor.Hardware.SensorType]::Temperature -and $null -ne $sensor.Value) {{
+            [PSCustomObject]@{{ HardwareType = $Hardware.HardwareType.ToString(); Sensor = $sensor.Name; Celsius = [math]::Round([double]$sensor.Value, 1) }}
+        }}
+    }}
+    foreach ($subHardware in $Hardware.SubHardware) {{
+        Read-Sensors $subHardware
+    }}
+}}
+$rows = foreach ($hardware in $computer.Hardware) {{ Read-Sensors $hardware }}
+$computer.Close()
+$cpuRows = $rows | Where-Object {{ $_.HardwareType -eq 'Cpu' }} | Where-Object {{ $_.Sensor -notmatch 'Distance to TjMax' }}
+$cpuPreferred = $cpuRows | Where-Object {{ $_.Sensor -in @('Core Max', 'CPU Package', 'Core Average', 'Tctl/Tdie', 'Tdie', 'Tctl') }}
+$cpuMax = ($cpuPreferred | Sort-Object Celsius -Descending | Select-Object -First 1).Celsius
+if ($null -eq $cpuMax) {{
+    $cpuMax = ($cpuRows | Sort-Object Celsius -Descending | Select-Object -First 1).Celsius
+}}
+$gpuHotspot = ($rows | Where-Object {{ $_.HardwareType -like 'Gpu*' }} | Where-Object {{ $_.Sensor -eq 'GPU Hot Spot' }} | Sort-Object Celsius -Descending | Select-Object -First 1).Celsius
+[PSCustomObject]@{{ cpu_max = $cpuMax; gpu_hotspot = $gpuHotspot }} | ConvertTo-Json -Compress
+"""
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]
 
 
 def normalize_path(value: str | None) -> str:
@@ -547,6 +606,81 @@ def rollout_activity(path_value: str | None) -> dict[str, Any]:
     }
 
 
+def normalize_plan_items(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    items = []
+    for item in value:
+        if isinstance(item, dict):
+            step = str(item.get("step") or item.get("text") or item.get("title") or "").strip()
+            status = str(item.get("status") or "").strip().lower()
+        else:
+            step = str(item).strip()
+            status = ""
+        if step:
+            items.append({"step": step, "status": status})
+    return items
+
+
+def plan_from_payload(payload: dict[str, Any]) -> list[dict[str, str]]:
+    candidates: list[Any] = []
+    for key in ("plan", "items", "steps"):
+        candidates.append(payload.get(key))
+    plan = payload.get("plan")
+    if isinstance(plan, dict):
+        for key in ("items", "steps"):
+            candidates.append(plan.get(key))
+    for candidate in candidates:
+        items = normalize_plan_items(candidate)
+        if items:
+            return items
+    return []
+
+
+def rollout_plan(path_value: str | None) -> dict[str, Any]:
+    path = Path(normalize_path(path_value))
+    if not path.exists():
+        return {}
+    latest_items: list[dict[str, str]] = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return {}
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        items: list[dict[str, str]] = []
+        if row.get("type") == "response_item" and payload.get("type") == "function_call":
+            name = str(payload.get("name") or "")
+            if name.endswith("update_plan"):
+                try:
+                    arguments = json.loads(str(payload.get("arguments") or "{}"))
+                except json.JSONDecodeError:
+                    arguments = {}
+                items = plan_from_payload(arguments)
+        elif row.get("type") == "event_msg":
+            ptype = str(payload.get("type") or "")
+            if "plan" in ptype.lower():
+                items = plan_from_payload(payload)
+        if items:
+            latest_items = items
+    if not latest_items:
+        return {}
+    total = len(latest_items)
+    completed = sum(1 for item in latest_items if item.get("status") == "completed")
+    in_progress = next((item["step"] for item in latest_items if item.get("status") == "in_progress"), "")
+    pending = sum(1 for item in latest_items if item.get("status") == "pending")
+    return {
+        "plan_total": total,
+        "plan_completed": completed,
+        "plan_pending": pending,
+        "plan_in_progress": in_progress,
+    }
+
+
 def sentence_candidates(text: str) -> list[str]:
     chunks = re.split(r"(?<=[.!?])\s+|\n+|; ", text)
     return [meaningful_text(chunk) for chunk in chunks if len(meaningful_text(chunk)) >= 18]
@@ -785,6 +919,7 @@ def export_state(args: argparse.Namespace) -> None:
         cached = cached_sessions.get(thread["id"], {})
         launch = launches.get(thread["id"], {}) if isinstance(launches.get(thread["id"]), dict) else {}
         activity = rollout_activity(rollout_path)
+        plan = rollout_plan(rollout_path)
         if cached.get("updated_at") == updated_at and cached.get("summary") and cached.get("version") == 5:
             generated = cached
         else:
@@ -844,6 +979,10 @@ def export_state(args: argparse.Namespace) -> None:
                 "rate_resets_at": activity.get("rate_resets_at") or 0,
                 "rate_plan_type": activity.get("rate_plan_type") or "",
                 "rate_limit_reached_type": activity.get("rate_limit_reached_type") or "",
+                "plan_total": plan.get("plan_total") or 0,
+                "plan_completed": plan.get("plan_completed") or 0,
+                "plan_pending": plan.get("plan_pending") or 0,
+                "plan_in_progress": plan.get("plan_in_progress") or "",
                 "status": "recent" if now - updated_at <= RECENT_SECONDS else "stale",
             }
         )
@@ -931,6 +1070,39 @@ def codex_state_signature() -> tuple[int, int, int, int, int]:
         except OSError:
             pass
     return db_mtime, db_size, count, max_mtime, total_size
+
+
+def board_state_signature() -> tuple[int, int, int, int, int]:
+    count = 0
+    max_mtime = 0
+    total_size = 0
+    for folder in (SESSIONS_DIR, MACHINES_DIR):
+        if not folder.exists():
+            continue
+        try:
+            paths = folder.glob("*.json")
+            for path in paths:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                count += 1
+                max_mtime = max(max_mtime, stat.st_mtime_ns)
+                total_size += stat.st_size
+        except OSError:
+            pass
+    manifest_mtime = 0
+    peers_mtime = 0
+    for path, index in ((MANIFEST_PATH, "manifest"), (PEERS_PATH, "peers")):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if index == "manifest":
+            manifest_mtime = stat.st_mtime_ns
+        else:
+            peers_mtime = stat.st_mtime_ns
+    return count, max_mtime, total_size, manifest_mtime, peers_mtime
 
 
 def run_external(command: list[str], quiet: bool = False) -> bool:
@@ -1148,6 +1320,11 @@ def all_sessions() -> list[dict[str, Any]]:
                     "rate_limit_reached_type",
                 ):
                     session[key] = activity.get(key) or session.get(key) or 0
+            if session.get("rollout_path") and not session.get("plan_total"):
+                plan = rollout_plan(session.get("rollout_path"))
+                if plan:
+                    session = dict(session)
+                    session.update(plan)
             session.setdefault("summary", session_summary(session, 120))
             session.setdefault("generated_title", session_summary(session, 120))
             session.setdefault("generated_summary", session_summary(session, 180))
@@ -1560,10 +1737,12 @@ KEY_BINDINGS: list[tuple[str, str, str]] = [
     ("Projects", "c", "Create a project and context file"),
     ("Projects", "p", "Assign selected session to current/project id"),
     ("Actions", "r", "Refresh local session export"),
+    ("Actions", "u", "Show local Codex usage stats"),
     ("Actions", "Enter", "Resume selected session"),
     ("Actions", "o", "Open/attach selected tmux or SSH session when metadata exists"),
     ("Actions", "?", "Show or hide this help"),
-    ("Actions", "q / Esc", "Quit"),
+    ("Actions", "Esc", "Back: close help/search or clear active filters"),
+    ("Actions", "q", "Quit"),
     ("Mouse", "Project click", "Filter to that project"),
     ("Mouse", "Session click", "Select that session"),
     ("Mouse", "Details click", "No selection; details are read-only"),
@@ -1711,6 +1890,16 @@ class DashboardApp:
             self.query = self.last_search
             self.apply_filter()
         self.move(delta)
+
+    def go_back(self) -> None:
+        if self.query:
+            self.query = ""
+            self.cursor = 0
+            self.top = 0
+            self.apply_filter()
+            self.message = "Search cleared"
+            return
+        self.message = "Press q to quit"
 
     def safe_add(self, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
         if width <= 0:
@@ -1877,8 +2066,10 @@ class DashboardApp:
                 self.stdscr.addnstr(0, 0, "Terminal too small for codex-dash", max(1, width - 1))
                 self.stdscr.refresh()
                 key = self.stdscr.getch()
-                if key in (ord("q"), 27):
+                if key == ord("q"):
                     return
+                if key == 27:
+                    self.go_back()
                 continue
 
             detail_height = min(10, max(5, height // 3))
@@ -1896,8 +2087,11 @@ class DashboardApp:
                 pending_g = False
                 continue
 
-            if key in (ord("q"), 27):
+            if key == ord("q"):
                 return
+            if key == 27:
+                self.go_back()
+                continue
             if key in (ord("j"), curses.KEY_DOWN):
                 self.move(1)
             elif key in (ord("k"), curses.KEY_UP):
@@ -1967,6 +2161,14 @@ class AnsiDashboardApp:
         self.top = 0
         self.focus = "sessions"
         self.show_help = False
+        self.help_top = 0
+        self.show_usage = False
+        self.usage_top = 0
+        self.usage_rows: list[str] = []
+        self.usage_error = ""
+        self.usage_loading = False
+        self.usage_thread: threading.Thread | None = None
+        self.usage_width = 0
         self.search_mode = False
         self.search_buffer = ""
         self.input_mode: str | None = None
@@ -1983,6 +2185,10 @@ class AnsiDashboardApp:
         self.refresh_process: subprocess.Popen[str] | None = None
         self.refresh_result: tuple[bool, str] | None = None
         self.refresh_old_ids: list[str | None] = []
+        self.last_board_signature: tuple[int, int, int, int, int] | None = None
+        self.temperature_process: subprocess.Popen[str] | None = None
+        self.temperature_last_refresh = 0.0
+        self.temperature_status: dict[str, float] = {}
         self.sessions: list[dict[str, Any]] = []
         self.visible: list[dict[str, Any]] = []
         self.manifest: dict[str, Any] = {"projects": []}
@@ -1995,9 +2201,26 @@ class AnsiDashboardApp:
         self.machines = machine_freshness()
         self.sessions = all_sessions()
         self.names, self.sub_names = manifest_names(self.manifest)
+        self.last_board_signature = board_state_signature()
         self.apply_filter()
         if not quiet:
             self.message = f"Loaded {len(self.sessions)} sessions"
+
+    def reload_if_board_changed(self) -> None:
+        signature = board_state_signature()
+        if self.last_board_signature is None:
+            self.last_board_signature = signature
+            return
+        if signature != self.last_board_signature:
+            current = self.current()
+            selected_id = current.get("id") if current else ""
+            self.reload(quiet=True)
+            if selected_id:
+                for index, session in enumerate(self.visible):
+                    if session.get("id") == selected_id:
+                        self.cursor = index
+                        break
+            self.message = f"Updated {len(self.sessions)} sessions"
 
     def auto_refresh(self, force: bool = False) -> None:
         if self.auto_refresh_interval <= 0 and not force:
@@ -2115,6 +2338,18 @@ class AnsiDashboardApp:
     def color(text: str, code: str) -> str:
         return f"\x1b[{code}m{text}\x1b[0m"
 
+    def chip(self, text: str, fg: str, bg: str, bold: bool = True) -> str:
+        weight = ";1" if bold else ""
+        return (
+            self.color("", f"38;2;{bg}")
+            + self.color(text, f"38;2;{fg};48;2;{bg}{weight}")
+            + self.color("", f"38;2;{bg}")
+        )
+
+    def block(self, text: str, fg: str, bg: str, bold: bool = True) -> str:
+        weight = ";1" if bold else ""
+        return self.color(text, f"38;2;{fg};48;2;{bg}{weight}")
+
     @staticmethod
     def strip_ansi(text: str) -> str:
         return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
@@ -2130,8 +2365,70 @@ class AnsiDashboardApp:
         visible = cls.visible_len(text)
         if visible <= width:
             return text + " " * (width - visible)
-        plain = cls.strip_ansi(text)
-        return cls.fit(plain, width)
+        if width <= 3:
+            return cls.truncate_ansi(text, width)
+        return cls.truncate_ansi(text, width - 3) + "..."
+
+    @staticmethod
+    def truncate_ansi(text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        out: list[str] = []
+        visible = 0
+        index = 0
+        reset_needed = False
+        while index < len(text) and visible < width:
+            if text[index] == "\x1b":
+                match = re.match(r"\x1b\[[0-9;?]*[A-Za-z]", text[index:])
+                if match:
+                    code = match.group(0)
+                    out.append(code)
+                    reset_needed = code != "\x1b[0m"
+                    index += len(code)
+                    continue
+            out.append(text[index])
+            visible += 1
+            index += 1
+        if reset_needed:
+            out.append("\x1b[0m")
+        return "".join(out)
+
+    @classmethod
+    def slice_ansi(cls, text: str, start: int, width: int) -> str:
+        if width <= 0:
+            return ""
+        plain_len = cls.visible_len(text)
+        if start >= plain_len:
+            return " " * width
+        out: list[str] = []
+        visible = 0
+        copied = 0
+        index = 0
+        reset_needed = False
+        while index < len(text) and copied < width:
+            if text[index] == "\x1b":
+                match = re.match(r"\x1b\[[0-9;?]*[A-Za-z]", text[index:])
+                if match:
+                    code = match.group(0)
+                    if visible >= start:
+                        out.append(code)
+                        reset_needed = code != "\x1b[0m"
+                    index += len(code)
+                    continue
+            if visible >= start:
+                out.append(text[index])
+                copied += 1
+            visible += 1
+            index += 1
+        if reset_needed:
+            out.append("\x1b[0m")
+        return "".join(out) + " " * max(0, width - copied)
+
+    def overlay_ansi_line(self, base: str, overlay: str, left: int, width: int) -> str:
+        left_part = self.slice_ansi(base, 0, left)
+        overlay_part = self.fit_ansi(overlay, width)
+        right_part = self.slice_ansi(base, left + width, max(0, self.visible_len(base) - left - width))
+        return left_part + overlay_part + right_part
 
     @classmethod
     def wrap_ansi(cls, text: str, width: int) -> list[str]:
@@ -2140,35 +2437,42 @@ class AnsiDashboardApp:
         return wrapped or [""]
 
     @staticmethod
-    def plain_box(width: int, title: str = "") -> str:
+    def plain_box(width: int, title: str = "", heavy: bool = False) -> str:
         if width < 4:
-            return "─" * width
-        line = "╭" + "─" * (width - 2) + "╮"
+            return ("━" if heavy else "─") * width
+        left, horizontal, right = ("┏", "━", "┓") if heavy else ("╭", "─", "╮")
+        line = left + horizontal * (width - 2) + right
         if title and width > len(title) + 6:
             label = f" {title} "
             line = line[:2] + label + line[2 + len(label) :]
         return line
 
     @staticmethod
-    def bottom_box(width: int) -> str:
+    def bottom_box(width: int, heavy: bool = False) -> str:
         if width < 4:
-            return "─" * width
-        return "╰" + "─" * (width - 2) + "╯"
+            return ("━" if heavy else "─") * width
+        left, horizontal, right = ("┗", "━", "┛") if heavy else ("╰", "─", "╯")
+        return left + horizontal * (width - 2) + right
 
-    def pane_row(self, content: str, width: int, border: str = "38;2;76;154;180") -> str:
+    def pane_row(self, content: str, width: int, border: str = "38;2;76;154;180", pane: str = "") -> str:
         if width < 4:
             return self.fit_ansi(content, width)
-        return self.color("│", border) + " " + self.fit_ansi(content, width - 4) + " " + self.color("│", border)
+        active = bool(pane and self.focus == pane)
+        border_color = self.pane_color(pane) if pane else border
+        vertical = "┃" if active else "│"
+        return self.color(vertical, border_color) + " " + self.fit_ansi(content, width - 4) + " " + self.color(vertical, border_color)
 
-    def pane_wrapped_rows(self, label: str, value: str, width: int, border: str = "38;2;76;154;180") -> list[str]:
+    def pane_wrapped_rows(self, label: str, value: str, width: int, border: str = "38;2;76;154;180", pane: str = "") -> list[str]:
         inner_width = max(1, width - 4)
         label_plain = self.strip_ansi(label)
         label_width = min(max(len(label_plain), 9), max(9, inner_width // 3))
         value_width = max(1, inner_width - label_width)
         rows = []
+        if self.visible_len(value) <= value_width:
+            return [self.pane_row(self.fit_ansi(label, label_width) + value, width, border, pane)]
         for index, chunk in enumerate(self.wrap_ansi(value, value_width)):
             prefix = label if index == 0 else " " * label_width
-            rows.append(self.pane_row(self.fit_ansi(prefix, label_width) + chunk, width, border))
+            rows.append(self.pane_row(self.fit_ansi(prefix, label_width) + chunk, width, border, pane))
         return rows
 
     def status_color(self, status: str) -> str:
@@ -2210,10 +2514,10 @@ class AnsiDashboardApp:
         return "38;2;126;203;255;1" if self.focus == pane else "38;2;76;154;180"
 
     def pane_top(self, width: int, title: str, pane: str) -> str:
-        return self.color(self.plain_box(width, title), self.pane_color(pane))
+        return self.color(self.plain_box(width, title, heavy=self.focus == pane), self.pane_color(pane))
 
     def pane_bottom(self, width: int, pane: str) -> str:
-        return self.color(self.bottom_box(width), self.pane_color(pane))
+        return self.color(self.bottom_box(width, heavy=self.focus == pane), self.pane_color(pane))
 
     def cycle_focus(self, delta: int) -> None:
         panes = ["projects", "sessions"]
@@ -2280,17 +2584,18 @@ class AnsiDashboardApp:
         project = "all" if self.project_filter == "all" else self.names.get(self.project_filter, self.project_filter)
         status = self.status_filter
         search = self.query or "none"
-        return (
-            self.color(f" 󰏗 {project} ", "30;48;2;126;203;255")
-            + " "
-            + self.color(f" 󰈙 {status} ", "30;48;2;245;194;96")
-            + " "
-            + self.color(f" 󰒺 {self.sort_mode} ", "30;48;2;174;141;255")
-            + " "
-            + self.color(f"  {search} ", "30;48;2;92;214;144")
-        )
+        chips = []
+        if self.project_filter != "all":
+            chips.append(self.chip(f" 󰏗 {project} ", "24;31;44", "126;203;255"))
+        if status != "all":
+            chips.append(self.chip(f" 󰈙 {status} ", "24;31;44", "245;194;96"))
+        if self.sort_mode != "updated":
+            chips.append(self.chip(f" 󰒺 {self.sort_mode} ", "24;31;44", "174;141;255"))
+        if self.query:
+            chips.append(self.chip(f"  {search} ", "24;31;44", "92;214;144"))
+        return " ".join(chips)
 
-    def usage_status_segments(self) -> str:
+    def usage_status_segments(self, width: int) -> str:
         local_machine = current_machine_payload(self.machines)
         usage = local_machine.get("latest_usage") if isinstance(local_machine.get("latest_usage"), dict) else {}
         if not usage:
@@ -2298,13 +2603,95 @@ class AnsiDashboardApp:
         account = current_account_label(self.machines)
         token = token_summary_label(usage)
         rate = rate_summary_label(usage)
-        parts = [self.color(f" account {short_title(account, 26)}", "38;2;245;194;96")]
+        if width < 128:
+            return ""
+        account_width = 14 if width < 150 else 26
+        account_label = "acct" if width < 150 else "account"
+        token_label = "tok" if width < 150 else "tokens"
+        rate_label = "lim" if width < 150 else "limits"
+        parts = [self.color(f" {account_label} {short_title(account, account_width)}", "38;2;245;194;96")]
         if token:
-            parts.append(self.color(f" tokens {token}", "38;2;126;203;255"))
-        if rate:
+            parts.append(self.color(f" {token_label} {token}", "38;2;126;203;255"))
+        if rate and width >= 150:
             rate_color = "38;2;245;108;108;1" if usage.get("rate_limit_reached_type") else "38;2;92;214;144"
-            parts.append(self.color(f" limits {rate}", rate_color))
+            parts.append(self.color(f" {rate_label} {rate}", rate_color))
         return " ".join(parts)
+
+    def update_temperature_status(self) -> None:
+        if self.temperature_process and self.temperature_process.poll() is not None:
+            stdout, _stderr = self.temperature_process.communicate()
+            self.temperature_process = None
+            try:
+                parsed = json.loads(stdout or "{}")
+            except json.JSONDecodeError:
+                parsed = {}
+            status: dict[str, float] = {}
+            for key in ("cpu_max", "gpu_hotspot"):
+                value = parsed.get(key)
+                if isinstance(value, (int, float)):
+                    status[key] = float(value)
+            if status:
+                self.temperature_status.update(status)
+
+        now = time.time()
+        if self.temperature_process or now - self.temperature_last_refresh < TEMPERATURE_REFRESH_SECONDS:
+            return
+
+        command = lhm_temperature_command()
+        if not command:
+            self.temperature_last_refresh = now
+            return
+
+        creationflags = subprocess.CREATE_NO_WINDOW if platform.system().lower() == "windows" else 0
+        try:
+            self.temperature_process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                creationflags=creationflags,
+            )
+            self.temperature_last_refresh = now
+        except OSError:
+            self.temperature_process = None
+            self.temperature_last_refresh = now
+
+    def temperature_status_segments(self) -> str:
+        self.update_temperature_status()
+        parts = []
+        cpu_max = self.temperature_status.get("cpu_max")
+        gpu_hotspot = self.temperature_status.get("gpu_hotspot")
+        if cpu_max is not None:
+            parts.append(self.color(f" cpu max {cpu_max:.0f}C", "38;2;245;194;96"))
+        if gpu_hotspot is not None:
+            parts.append(self.color(f" gpu hot {gpu_hotspot:.0f}C", "38;2;245;108;108"))
+        return " ".join(parts)
+
+    def temperature_header_segments(self, width: int) -> str:
+        self.update_temperature_status()
+        cpu_max = self.temperature_status.get("cpu_max")
+        gpu_hotspot = self.temperature_status.get("gpu_hotspot")
+        parts = []
+        if cpu_max is not None:
+            parts.append(self.color(f"  {cpu_max:.0f}C ", "38;2;245;194;96;1"))
+        if gpu_hotspot is not None:
+            parts.append(self.color(f" 󰢮 {gpu_hotspot:.0f}C ", "38;2;245;108;108;1"))
+        return " ".join(parts)
+
+    def plan_progress_label(self, session: dict[str, Any], width: int) -> str:
+        total = int(session.get("plan_total") or 0)
+        if total <= 0:
+            return ""
+        completed = min(total, max(0, int(session.get("plan_completed") or 0)))
+        fraction = completed / total if total else 0
+        bar_width = max(8, min(24, width // 4))
+        filled = round(bar_width * fraction)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        current = str(session.get("plan_in_progress") or "").strip()
+        suffix = f" {completed}/{total}"
+        if current:
+            suffix += f" · {short_title(current, max(16, width - bar_width - len(suffix) - 18))}"
+        return self.color(bar, "38;2;92;214;144;1") + suffix
 
     @staticmethod
     def project_icon(project_id: str, label: str) -> str:
@@ -2333,27 +2720,39 @@ class AnsiDashboardApp:
                 "assign_project": "assign project id",
             }
             label = labels.get(self.input_mode, self.input_mode)
-            prompt = self.color(f" {label} ", "38;2;24;31;44;48;2;245;194;96;1")
+            prompt = self.block(f" {label} ", "24;31;44", "245;194;96")
             hint = "Enter accept  Esc cancel"
             value = self.input_buffer or hint
             return self.fit_ansi(prompt + self.color(" " + value, "38;2;238;241;245;48;2;24;31;44"), width)
         if self.search_mode:
-            prompt = self.color(" / ", "38;2;24;31;44;48;2;92;214;144;1")
+            prompt = self.block(" / ", "24;31;44", "92;214;144")
             value = self.color(self.search_buffer or "type to filter, Enter accept, Esc cancel", "38;2;238;241;245;48;2;24;31;44")
             return self.fit_ansi(prompt + value, width)
         selected = f"{self.cursor + 1}/{len(self.visible)}" if self.visible else "0/0"
         project = "all" if self.project_filter == "all" else self.names.get(self.project_filter, self.project_filter)
         message = self.message or "ready"
+        project_width = 10 if width < 96 else 18
+        query_width = 10 if width < 128 else 18
+        focus_label = self.focus[:4] if width < 72 else self.focus
         segments = [
-            self.color(f" 󰌌 {self.focus} ", "38;2;24;31;44;48;2;126;203;255;1"),
-            self.color(f" 󰈙 {selected} ", "38;2;24;31;44;48;2;92;214;144;1"),
-            self.color(f" 󰏗 {short_title(project, 18)} ", "38;2;24;31;44;48;2;245;194;96;1"),
-            self.color(f"  {short_title(self.query or 'none', 18)} ", "38;2;24;31;44;48;2;174;141;255;1"),
+            self.block(f" P {focus_label} ", "24;31;44", "126;203;255"),
+            self.block(f" S {selected} ", "24;31;44", "92;214;144"),
+            self.block(f" Prj {short_title(project, project_width)} ", "24;31;44", "245;194;96"),
         ]
-        hints = self.color(" ? help  h/l panels  j/k move  / search  c new  p assign  o attach  Enter resume  q quit ", "38;2;238;241;245;48;2;24;31;44")
+        if width >= 96:
+            segments.append(self.block(f" Find {short_title(self.query or 'none', query_width)} ", "24;31;44", "174;141;255"))
+        if width < 96:
+            hints = self.block(" ? help  / find  Enter  q ", "238;241;245", "24;31;44", bold=False)
+        elif width < 160:
+            hints = self.block(" ? h/l  /  o  Enter  q ", "238;241;245", "24;31;44", bold=False)
+        else:
+            hints = self.block(" ? help  h/l panels  j/k move  / search  c new  p assign  o attach  Enter resume  q quit ", "238;241;245", "24;31;44", bold=False)
         left = " ".join(segments)
-        usage = self.usage_status_segments()
-        body = left + " " + self.color(f" {short_title(message, 34)} ", "38;2;220;224;232;48;2;36;46;64") + " " + hints + usage
+        usage = self.usage_status_segments(width)
+        message_width = 16 if width < 96 else 24 if width < 128 else 34
+        body = left + " " + self.block(f" {short_title(message, message_width)} ", "220;224;232", "36;46;64", bold=False) + " " + hints
+        if usage and self.visible_len(body + " " + usage) <= width:
+            body += " " + usage
         return self.fit_ansi(body, width)
 
     def render_sidebar(self, height: int, width: int) -> list[str]:
@@ -2368,11 +2767,11 @@ class AnsiDashboardApp:
             usable = max(1, width - len(count_text) - 6)
             line = self.fit(text, usable) + self.color(count_text.rjust(len(count_text)), "38;2;150;158;171")
             if active:
-                lines.append(self.pane_row(self.color(self.fit_ansi(line, width - 4), "30;48;2;126;203;255;1"), width))
+                lines.append(self.pane_row(self.color(self.fit_ansi(line, width - 4), "30;48;2;126;203;255;1"), width, pane="projects"))
             else:
                 color = "38;2;126;203;255" if project_id == "all" else "38;2;220;224;232"
-                lines.append(self.pane_row(self.color(line, color), width))
-        lines.extend(self.pane_row("", width) for _ in range(max(0, height - len(lines) - 1)))
+                lines.append(self.pane_row(self.color(line, color), width, pane="projects"))
+        lines.extend(self.pane_row("", width, pane="projects") for _ in range(max(0, height - len(lines) - 1)))
         lines.append(self.pane_bottom(width, "projects"))
         return lines[:height]
 
@@ -2383,11 +2782,11 @@ class AnsiDashboardApp:
         lines = [self.pane_top(width, "󰈙 Sessions", "sessions")]
         title_width = max(12, inner_width - 78)
         heading = f"{'#':>3} {'state':12} {'activity':12} {'tokens':9} {'scope':20} {'updated':16} {'title':{title_width}.{title_width}}"
-        lines.append(self.pane_row(self.color(heading, "38;2;126;203;255;1"), width))
+        lines.append(self.pane_row(self.color(heading, "38;2;126;203;255;1"), width, pane="sessions"))
 
         if not self.visible:
             msg = "No sessions match. Press x to clear filters, / to search, or [ ] to change project."
-            lines.append(self.pane_row(self.color(msg, "38;2;126;203;255"), width))
+            lines.append(self.pane_row(self.color(msg, "38;2;126;203;255"), width, pane="sessions"))
         else:
             for offset, session in enumerate(self.visible[self.top : self.top + list_rows]):
                 index = self.top + offset
@@ -2417,12 +2816,15 @@ class AnsiDashboardApp:
                     + self.color(f"{title:{title_width}.{title_width}}", text_color)
                 )
                 if index == self.cursor:
-                    lines.append(self.pane_row(self.color("▌ " + self.fit_ansi(row, inner_width - 2), "30;48;2;126;203;255;1"), width))
+                    lines.append(self.pane_row(self.color("▌ " + self.fit_ansi(row, inner_width - 2), "30;48;2;126;203;255;1"), width, pane="sessions"))
                 else:
-                    lines.append(self.pane_row(row, width))
-        lines.extend(self.pane_row("", width) for _ in range(max(0, height - len(lines) - 1)))
+                    lines.append(self.pane_row(row, width, pane="sessions"))
+        lines.extend(self.pane_row("", width, pane="sessions") for _ in range(max(0, height - len(lines) - 1)))
         scroll = f"{self.cursor + 1 if self.visible else 0}/{len(self.visible)}"
-        footer = "╰" + "─" * max(0, width - len(scroll) - 4) + f" {scroll} ╯"
+        if self.focus == "sessions":
+            footer = "┗" + "━" * max(0, width - len(scroll) - 4) + f" {scroll} ┛"
+        else:
+            footer = "╰" + "─" * max(0, width - len(scroll) - 4) + f" {scroll} ╯"
         lines.append(self.color(self.fit(footer, width), self.pane_color("sessions")))
         return lines[:height]
 
@@ -2432,26 +2834,27 @@ class AnsiDashboardApp:
         if self.focus == "projects":
             project_id = self.project_filter
             if project_id == "all":
-                lines.append(self.pane_row(self.color("󰏗 All Projects", "38;2;126;203;255;1"), width))
-                lines.extend(self.pane_wrapped_rows(self.color("󰍔 summary".ljust(10), "38;2;150;158;171"), generated_project_summary("all", self.sessions, inner_width) or "Select a project to see its context and active Codex work.", width))
-                lines.extend(self.pane_wrapped_rows(self.color("󰈙 sessions".ljust(10), "38;2;150;158;171"), f"{len(self.sessions)} total sessions across {max(0, len(self.project_counts()) - 1)} projects.", width))
+                lines.append(self.pane_row(self.color("󰏗 All Projects", "38;2;126;203;255;1"), width, pane="details"))
+                lines.extend(self.pane_wrapped_rows(self.color("󰍔 summary".ljust(10), "38;2;150;158;171"), generated_project_summary("all", self.sessions, inner_width) or "Select a project to see its context and active Codex work.", width, pane="details"))
+                lines.extend(self.pane_wrapped_rows(self.color("󰈙 sessions".ljust(10), "38;2;150;158;171"), f"{len(self.sessions)} total sessions across {max(0, len(self.project_counts()) - 1)} projects.", width, pane="details"))
             else:
                 name = self.names.get(project_id, project_id)
+                icon = self.project_icon(project_id, name)
                 context = project_context_summary(project_id, inner_width) or "No Markdown context yet. Press c to create/update project context."
                 summary = generated_project_summary(project_id, self.sessions, inner_width) or "No sessions currently match this project."
                 count = sum(1 for session in self.sessions if session.get("project_id") == project_id)
-                lines.append(self.pane_row(self.color(f"󰏗 {name}", "38;2;126;203;255;1"), width))
-                lines.extend(self.pane_wrapped_rows(self.color("󰎞 context".ljust(10), "38;2;150;158;171"), context, width))
-                lines.extend(self.pane_wrapped_rows(self.color("󰍔 summary".ljust(10), "38;2;150;158;171"), summary, width))
-                lines.extend(self.pane_wrapped_rows(self.color("󰈙 sessions".ljust(10), "38;2;150;158;171"), f"{count} sessions assigned or inferred for this project.", width))
+                lines.append(self.pane_row(self.color(f"{icon} {name}", "38;2;126;203;255;1"), width, pane="details"))
+                lines.extend(self.pane_wrapped_rows(self.color("󰎞 context".ljust(10), "38;2;150;158;171"), context, width, pane="details"))
+                lines.extend(self.pane_wrapped_rows(self.color("󰍔 summary".ljust(10), "38;2;150;158;171"), summary, width, pane="details"))
+                lines.extend(self.pane_wrapped_rows(self.color("󰈙 sessions".ljust(10), "38;2;150;158;171"), f"{count} sessions assigned or inferred for this project.", width, pane="details"))
             lines = lines[: max(1, height - 1)]
-            lines.extend(self.pane_row("", width) for _ in range(max(0, height - len(lines) - 1)))
+            lines.extend(self.pane_row("", width, pane="details") for _ in range(max(0, height - len(lines) - 1)))
             lines.append(self.pane_bottom(width, "details"))
             return lines[:height]
 
         session = self.current()
         if not session:
-            lines.append(self.pane_row("No selected session", width))
+            lines.append(self.pane_row("No selected session", width, pane="details"))
         else:
             project = session.get("project_id", "uncategorized")
             subproject = session.get("subproject_id", "default")
@@ -2460,41 +2863,50 @@ class AnsiDashboardApp:
             token_label = token_summary_label(session) or "none"
             rate_label = rate_summary_label(session) or "none"
             account_label = str(session.get("account_label") or session.get("account_email") or current_account_label(self.machines))
-            lines.append(self.pane_row(self.color(f"󰏗 {self.names.get(project, project)}  󰝰 {self.sub_names.get((project, subproject), subproject)}", "38;2;126;203;255;1"), width))
+            project_name = self.names.get(project, project)
+            project_icon = self.project_icon(str(project), str(project_name))
+            lines.append(self.pane_row(self.color(f"{project_icon} {project_name}  󰝰 {self.sub_names.get((project, subproject), subproject)}", "38;2;126;203;255;1"), width, pane="details"))
             fields = [
                 ("󰌷 id", str(session.get("id"))),
                 ("󰄬 status", f"{self.strip_ansi(self.status_badge(status, session))}  {session.get('machine_id', '?')}  {format_ts(session.get('updated_at'))}"),
-                ("activity", activity),
-                ("account", account_label),
-                ("tokens", f"{token_label}; last {compact_number(session.get('last_tokens')) or '0'}; in {compact_number(session.get('input_tokens')) or '0'} cached {compact_number(session.get('cached_input_tokens')) or '0'} out {compact_number(session.get('output_tokens')) or '0'} reason {compact_number(session.get('reasoning_output_tokens')) or '0'}"),
-                ("limits", rate_label),
-                ("origin", launch_label(session)),
-                ("attach", str(session.get("attach_command") or "")),
+                ("󰔟 activity", activity),
+                ("󰀄 account", account_label),
+                ("󰓅 tokens", f"{token_label}; last {compact_number(session.get('last_tokens')) or '0'}; in {compact_number(session.get('input_tokens')) or '0'} cached {compact_number(session.get('cached_input_tokens')) or '0'} out {compact_number(session.get('output_tokens')) or '0'} reason {compact_number(session.get('reasoning_output_tokens')) or '0'}"),
+                ("󰍉 limits", rate_label),
+                ("󰅩 origin", launch_label(session)),
+                ("󰁔 attach", str(session.get("attach_command") or "")),
                 ("󰉋 cwd", str(session.get("cwd") or "")),
                 (" branch", str(session.get("git_branch") or "")),
                 ("󰚩 model", f"{session.get('model') or ''} {session.get('reasoning_effort') or ''}".rstrip()),
                 ("󰍔 summary", str(session.get("generated_summary") or session_summary(session, inner_width - 10))),
             ]
+            plan_label = self.plan_progress_label(session, inner_width)
+            if plan_label:
+                fields.insert(2, ("󰐱 plan", plan_label))
             for label, value in fields:
-                lines.extend(self.pane_wrapped_rows(self.color(label.ljust(10), "38;2;150;158;171"), value, width))
+                lines.extend(self.pane_wrapped_rows(self.color(label.ljust(10), "38;2;150;158;171"), value, width, pane="details"))
             context = project_context_summary(str(project), inner_width)
             if context:
-                lines.extend(self.pane_wrapped_rows(self.color("󰎞 context".ljust(10), "38;2;150;158;171"), context, width))
+                lines.extend(self.pane_wrapped_rows(self.color("󰎞 context".ljust(10), "38;2;150;158;171"), context, width, pane="details"))
             project_summary = generated_project_summary(str(project), self.sessions, inner_width)
             sub_summary = generated_subproject_summary(str(project), str(subproject), self.sessions, inner_width)
             if project_summary:
-                lines.extend(self.pane_wrapped_rows(self.color("󰏗 project".ljust(10), "38;2;150;158;171"), project_summary, width))
+                lines.extend(self.pane_wrapped_rows(self.color("󰏗 project".ljust(10), "38;2;150;158;171"), project_summary, width, pane="details"))
             if sub_summary:
-                lines.extend(self.pane_wrapped_rows(self.color("󰝰 instance".ljust(10), "38;2;150;158;171"), sub_summary, width))
+                lines.extend(self.pane_wrapped_rows(self.color("󰝰 instance".ljust(10), "38;2;150;158;171"), sub_summary, width, pane="details"))
         lines = lines[: max(1, height - 1)]
-        lines.extend(self.pane_row("", width) for _ in range(max(0, height - len(lines) - 1)))
+        lines.extend(self.pane_row("", width, pane="details") for _ in range(max(0, height - len(lines) - 1)))
         lines.append(self.pane_bottom(width, "details"))
         return lines[:height]
 
     def render(self) -> str:
         if self.show_help:
             return self.render_help()
+        if self.show_usage:
+            return self.render_usage_overlay()
+        return self.render_dashboard()
 
+    def render_dashboard(self) -> str:
         height, width = self.term_size()
         width = max(50, width)
         height = max(12, height)
@@ -2503,11 +2915,19 @@ class AnsiDashboardApp:
         sidebar_width = 28 if width >= 96 else 0
         gap = 1 if sidebar_width else 0
         list_width = width - sidebar_width - gap
-        title = self.color(" 󰚩 Codex Dash ", "38;2;238;241;245;48;2;24;31;44;1")
-        counts = self.color(f" 󰈙 {len(self.visible)}/{len(self.sessions)} ", "38;2;24;31;44;48;2;126;203;255;1")
-        machine = self.color(f"  {machine_id()} ", "38;2;24;31;44;48;2;92;214;144;1")
+        title = self.chip(" ◈ Codex Dashboard ", "238;241;245", "24;31;44")
+        counts = self.chip(f" 󰈙 {len(self.visible)}/{len(self.sessions)} ", "24;31;44", "126;203;255")
+        machine = self.chip(f"  {machine_id()} ", "24;31;44", "92;214;144")
         chips = self.filter_chips()
-        header = title + " " + counts + " " + machine + " " + chips
+        temperatures = self.temperature_header_segments(width)
+        header_left = title + " " + counts + " " + machine
+        if width >= 120 and chips:
+            header_left += " " + chips
+        if temperatures:
+            left_width = max(1, width - self.visible_len(temperatures) - 1)
+            header = self.fit_ansi(header_left, left_width) + " " + temperatures
+        else:
+            header = self.fit_ansi(header_left, width)
         rows: list[str] = ["\x1b[?25l\x1b[H" + self.fit_ansi(header, width)]
 
         list_lines = self.render_session_list(body_height, list_width)
@@ -2522,31 +2942,148 @@ class AnsiDashboardApp:
         rows.append(self.status_bar(width))
         return "\n".join(rows[:height]) + "\x1b[J"
 
-    def render_help(self) -> str:
+    def help_content_rows(self, body_width: int) -> list[str]:
+        rows: list[str] = []
+        current = ""
+        inner_width = max(1, body_width - 4)
+        key_width = min(18, max(9, inner_width // 4))
+        desc_width = max(12, inner_width - key_width - 1)
+        for group, keys, description in KEY_BINDINGS:
+            if group != current:
+                if current:
+                    rows.append(self.pane_row("", body_width, "38;2;126;203;255"))
+                current = group
+                rows.append(self.pane_row(self.color(group, "38;2;245;194;96;1"), body_width, "38;2;126;203;255"))
+                rows.append(self.pane_row(self.color("─" * inner_width, "38;2;76;154;180"), body_width, "38;2;126;203;255"))
+            wrapped = textwrap.wrap(description, width=desc_width, break_long_words=False, break_on_hyphens=False) or [""]
+            content = self.color(f"{keys:<{key_width}.{key_width}}", "38;2;126;203;255;1") + " " + wrapped[0]
+            rows.append(self.pane_row(content, body_width, "38;2;126;203;255"))
+            for extra in wrapped[1:]:
+                rows.append(self.pane_row(" " * (key_width + 1) + extra, body_width, "38;2;126;203;255"))
+        return rows
+
+    def modal_dimensions(self) -> tuple[int, int]:
         height, width = self.term_size()
         width = max(50, width)
         height = max(12, height)
-        body_width = min(width, 96)
-        left = 0
-        rows = ["\x1b[?25l\x1b[H"]
-        top = self.color(self.plain_box(body_width, "? Key Bindings"), "38;2;126;203;255;1")
-        pad = " " * left
-        rows.append(pad + top)
-        current = ""
-        for group, keys, description in KEY_BINDINGS:
-            if len(rows) >= height - 2:
-                break
-            if group != current:
-                if current and len(rows) < height - 2:
-                    rows.append(pad + self.pane_row("", body_width, "38;2;126;203;255"))
-                current = group
-                rows.append(pad + self.pane_row(self.color(group, "38;2;245;194;96;1"), body_width, "38;2;126;203;255"))
-            content = self.color(f"{keys:<18}", "38;2;126;203;255;1") + " " + description
-            rows.append(pad + self.pane_row(content, body_width, "38;2;126;203;255"))
-        rows.extend(pad + self.pane_row("", body_width, "38;2;126;203;255") for _ in range(max(0, height - len(rows) - 2)))
-        rows.append(pad + self.color(self.bottom_box(body_width), "38;2;126;203;255;1"))
-        rows.append(self.color(self.fit(" Press ? or Esc to return. q quits. Outside the UI: codex-dash keys", width), "38;2;24;31;44;48;2;126;203;255"))
-        return "\n".join(rows[:height]) + "\x1b[J"
+        modal_width = min(width - 4, max(42, int(width * 0.82)))
+        modal_height = min(height - 4, max(10, int(height * 0.78)))
+        return modal_width, modal_height
+
+    def render_centered_overlay(self, title: str, content_rows: list[str], scroll_top: int, hint_left: str, border: str = "38;2;126;203;255") -> tuple[str, int]:
+        height, width = self.term_size()
+        width = max(50, width)
+        height = max(12, height)
+        base = self.render_dashboard()
+        base_rows = base.removesuffix("\x1b[J").splitlines()
+        if base_rows:
+            base_rows[0] = base_rows[0].replace("\x1b[?25l\x1b[H", "", 1)
+        body_width, modal_height = self.modal_dimensions()
+        content_height = max(1, modal_height - 3)
+        max_top = max(0, len(content_rows) - content_height)
+        scroll_top = min(max(0, scroll_top), max_top)
+
+        rows = [self.color(self.plain_box(body_width, title), border + ";1")]
+        rows.extend(content_rows[scroll_top : scroll_top + content_height])
+        rows.extend(self.pane_row("", body_width, "38;2;126;203;255") for _ in range(max(0, content_height - (len(rows) - 1))))
+        position = f"{scroll_top + 1}-{min(len(content_rows), scroll_top + content_height)}/{len(content_rows)}" if content_rows else "0/0"
+        hint = self.color(f" {hint_left}  j/k scroll  ↑/↓ scroll  Esc back  q quit  {position} ", "38;2;24;31;44;48;2;126;203;255;1")
+        hint = self.color(f" {hint_left}  j/k scroll  Up/Down scroll  Esc back  q quit  {position} ", "38;2;24;31;44;48;2;126;203;255;1")
+        rows.append(self.pane_row(hint, body_width, border))
+        rows.append(self.color(self.bottom_box(body_width), border + ";1"))
+
+        left = max(0, (width - body_width) // 2)
+        top_y = max(0, (height - len(rows)) // 2)
+        composed = []
+        prefix = "\x1b[?25l\x1b[H"
+        for index in range(height):
+            base_line = base_rows[index] if index < len(base_rows) else " " * width
+            if top_y <= index < top_y + len(rows):
+                line = self.overlay_ansi_line(base_line, rows[index - top_y], left, body_width)
+            else:
+                line = self.fit_ansi(base_line, width)
+            composed.append((prefix if index == 0 else "") + self.fit_ansi(line, width))
+        return "\n".join(composed[:height]) + "\x1b[J", scroll_top
+
+    def render_help(self) -> str:
+        body_width, _ = self.modal_dimensions()
+        rendered, self.help_top = self.render_centered_overlay("? Key Bindings", self.help_content_rows(body_width), self.help_top, "help")
+        return rendered
+
+    def usage_content_rows(self, body_width: int) -> list[str]:
+        inner_width = max(1, body_width - 4)
+        if self.usage_loading:
+            raw_rows = ["Loading local Codex usage stats...", "", "Reading .codex session cache, dashboard exports, and local log databases."]
+        elif self.usage_error:
+            raw_rows = ["Local usage stats failed", "", self.usage_error]
+        elif self.usage_rows:
+            raw_rows = self.usage_rows
+        else:
+            raw_rows = ["Press u to load local Codex usage stats."]
+        rows = []
+        for index, raw in enumerate(raw_rows):
+            if not raw:
+                rows.append(self.pane_row("", body_width, "38;2;126;203;255"))
+                continue
+            next_raw = raw_rows[index + 1] if index + 1 < len(raw_rows) else ""
+            is_heading = raw == "Local Codex Usage" or (next_raw and set(next_raw) in ({"-"}, {"─"}))
+            is_rule = set(raw) in ({"-"}, {"─"})
+            if is_heading:
+                color = "38;2;245;194;96;1"
+            elif is_rule:
+                color = "38;2;76;154;180"
+                raw = "─" * inner_width
+            else:
+                color = "38;2;220;224;232"
+            rows.append(self.pane_row(self.color(raw, color), body_width, "38;2;126;203;255"))
+        return rows
+
+    def render_usage_overlay(self) -> str:
+        body_width, _ = self.modal_dimensions()
+        content_width = max(32, body_width - 4)
+        if self.usage_rows and not self.usage_loading and not self.usage_error and self.usage_width != content_width:
+            dashboard = build_usage_dashboard(top=8, show_errors=False, width=content_width)
+            self.usage_rows = list(dashboard.get("lines") or [])
+            self.usage_width = content_width
+        rendered, self.usage_top = self.render_centered_overlay("Local Codex Usage", self.usage_content_rows(body_width), self.usage_top, "u refresh")
+        return rendered
+
+    def start_usage_refresh(self) -> None:
+        if self.usage_loading:
+            return
+        self.usage_loading = True
+        self.usage_error = ""
+        self.usage_rows = []
+        self.usage_top = 0
+        body_width, _ = self.modal_dimensions()
+        content_width = max(32, body_width - 4)
+        self.usage_width = content_width
+
+        def worker() -> None:
+            try:
+                dashboard = build_usage_dashboard(top=8, show_errors=False, width=content_width)
+                lines = list(dashboard.get("lines") or [])
+                errors = list(dashboard.get("errors") or [])
+                if errors:
+                    lines.extend(["", f"Skipped {len(errors)} local source(s). Run codex-dash usage --show-errors for details."])
+                self.usage_rows = lines or ["No usage stats returned."]
+            except Exception as exc:
+                self.usage_error = str(exc)
+            finally:
+                self.usage_loading = False
+
+        self.usage_thread = threading.Thread(target=worker, daemon=True)
+        self.usage_thread.start()
+
+    def open_usage_overlay(self, refresh: bool = False) -> None:
+        self.show_usage = True
+        self.show_help = False
+        if refresh or (not self.usage_rows and not self.usage_error):
+            self.start_usage_refresh()
+
+    def modal_content_height(self) -> int:
+        _, modal_height = self.modal_dimensions()
+        return max(1, modal_height - 3)
 
     def prompt_search(self) -> None:
         self.search_mode = True
@@ -2566,6 +3103,53 @@ class AnsiDashboardApp:
         self.search_mode = False
         self.search_buffer = ""
         self.message = "Search cancelled"
+
+    def go_back(self) -> None:
+        if self.show_help:
+            self.show_help = False
+            self.message = "Help closed"
+            return
+        if self.show_usage:
+            self.show_usage = False
+            self.message = "Stats closed"
+            return
+        if self.query:
+            self.query = ""
+            self.cursor = 0
+            self.top = 0
+            self.apply_filter()
+            self.message = "Search cleared"
+            return
+        if self.project_filter != "all" or self.status_filter != "all":
+            self.project_filter = "all"
+            self.status_filter = "all"
+            self.cursor = 0
+            self.top = 0
+            self.apply_filter()
+            self.message = "Filters cleared"
+            return
+        if self.sort_mode != "updated":
+            self.sort_mode = "updated"
+            self.cursor = 0
+            self.top = 0
+            self.apply_filter()
+            self.message = "Sort: updated"
+            return
+        if self.focus != "sessions":
+            self.focus = "sessions"
+            self.message = "Focus: sessions"
+            return
+        self.message = "Press q to quit"
+
+    def scroll_help(self, delta: int) -> None:
+        body_width, _ = self.modal_dimensions()
+        max_top = max(0, len(self.help_content_rows(body_width)) - self.modal_content_height())
+        self.help_top = min(max(self.help_top + delta, 0), max_top)
+
+    def scroll_usage(self, delta: int) -> None:
+        body_width, _ = self.modal_dimensions()
+        max_top = max(0, len(self.usage_content_rows(body_width)) - self.modal_content_height())
+        self.usage_top = min(max(self.usage_top + delta, 0), max_top)
 
     def prompt_create_project(self) -> None:
         self.input_mode = "create_id"
@@ -2935,13 +3519,14 @@ class AnsiDashboardApp:
                 key = self.read_key(timeout=0.2)
                 if key == "tick":
                     self.spinner_index = (self.spinner_index + 1) % len(SPINNER_FRAMES)
-                    if not self.search_mode and not self.input_mode and not self.show_help:
+                    if not self.search_mode and not self.input_mode and not self.show_help and not self.show_usage:
+                        self.reload_if_board_changed()
                         self.auto_refresh()
                     continue
                 if key.startswith("mouse:"):
                     _, button, x, y, released = key.split(":")
-                    if self.show_help:
-                        self.show_help = False
+                    if self.show_help or self.show_usage:
+                        self.go_back()
                         continue
                     self.handle_mouse(int(x), int(y), int(button), released == "True")
                     continue
@@ -2960,17 +3545,61 @@ class AnsiDashboardApp:
                 if self.show_help:
                     if key == "q":
                         return
-                    self.show_help = False
+                    if key == "\x1b":
+                        self.go_back()
+                        continue
+                    if key in ("j", "down"):
+                        self.scroll_help(1)
+                        continue
+                    if key in ("k", "up"):
+                        self.scroll_help(-1)
+                        continue
+                    if key in ("pagedown", "\x06"):
+                        self.scroll_help(5)
+                        continue
+                    if key in ("pageup", "\x02"):
+                        self.scroll_help(-5)
+                        continue
+                    continue
+                if self.show_usage:
+                    if key == "q":
+                        return
+                    if key == "\x1b":
+                        self.go_back()
+                        continue
+                    if key == "u":
+                        self.start_usage_refresh()
+                        continue
+                    if key in ("j", "down"):
+                        self.scroll_usage(1)
+                        continue
+                    if key in ("k", "up"):
+                        self.scroll_usage(-1)
+                        continue
+                    if key in ("pagedown", "\x06"):
+                        self.scroll_usage(5)
+                        continue
+                    if key in ("pageup", "\x02"):
+                        self.scroll_usage(-5)
+                        continue
                     continue
                 if pending_g:
                     if key == "g":
                         self.cursor = 0
                     pending_g = False
                     continue
-                if key in ("q", "\x1b"):
+                if key == "q":
                     return
+                if key == "\x1b":
+                    self.go_back()
+                    continue
                 if key == "?":
                     self.show_help = True
+                    self.help_top = 0
+                    continue
+                if key == "u":
+                    self.open_usage_overlay()
+                    continue
                 if key in ("j", "down"):
                     self.vertical_move(1)
                 elif key in ("k", "up"):
@@ -3221,10 +3850,10 @@ def command_sync(args: argparse.Namespace) -> None:
 
 
 def command_watch(args: argparse.Namespace) -> None:
-    interval = max(1.0, float(getattr(args, "interval", 1.0) or 1.0))
-    debounce = max(0.1, float(getattr(args, "debounce", 0.75) or 0.75))
+    interval = max(0.1, float(getattr(args, "interval", 0.2) or 0.2))
+    debounce = max(0.05, float(getattr(args, "debounce", 0.15) or 0.15))
     heartbeat = max(2.0, float(getattr(args, "heartbeat", 5.0) or 5.0))
-    sync_interval = max(0.0, float(getattr(args, "sync_interval", 10.0) or 0.0))
+    sync_interval = max(0.0, float(getattr(args, "sync_interval", 2.0) or 0.0))
     quiet = bool(getattr(args, "quiet", False))
     targets = [str(target).strip() for target in getattr(args, "targets", []) if str(target).strip()]
     configured_peers = sync_peers_from_args(args)
@@ -3233,6 +3862,29 @@ def command_watch(args: argparse.Namespace) -> None:
     pending_since: float | None = None
     last_refresh = 0.0
     last_sync = 0.0
+
+    def sync_now(reason: str) -> None:
+        nonlocal last_sync
+        if not configured_peers or sync_interval <= 0:
+            return
+        sync_args = argparse.Namespace(
+            targets=targets,
+            direction=getattr(args, "direction", "both"),
+            remote_board_path=getattr(args, "remote_board_path", "~/.codex/instance-board"),
+            remote_codex_home=getattr(args, "remote_codex_home", ""),
+            local_board_path=getattr(args, "local_board_path", ""),
+            local_codex_home=getattr(args, "local_codex_home", ""),
+            skip_local_refresh=True,
+            skip_remote_refresh=getattr(args, "skip_remote_refresh", False),
+            limit=getattr(args, "limit", 500),
+            quiet=quiet,
+        )
+        synced = sync_state_once(sync_args)
+        last_sync = time.time()
+        if not quiet:
+            peer_labels = [peer["target"] for peer in configured_peers]
+            label = "synced" if synced else "sync had errors"
+            print(f"{dt.datetime.now().strftime('%H:%M:%S')} {label} ({reason}): {', '.join(peer_labels)}", flush=True)
 
     def refresh(reason: str) -> None:
         nonlocal last_refresh
@@ -3243,6 +3895,8 @@ def command_watch(args: argparse.Namespace) -> None:
                 print(f"{dt.datetime.now().strftime('%H:%M:%S')} refreshed ({reason})", flush=True)
             else:
                 print(f"{dt.datetime.now().strftime('%H:%M:%S')} refresh failed: {error}", file=sys.stderr, flush=True)
+        if ok and reason in {"startup", "codex state changed"}:
+            sync_now(reason)
 
     refresh("startup")
     last_signature = codex_state_signature()
@@ -3262,24 +3916,7 @@ def command_watch(args: argparse.Namespace) -> None:
             refresh("heartbeat")
 
         if configured_peers and sync_interval > 0 and now - last_sync >= sync_interval:
-            sync_args = argparse.Namespace(
-                targets=targets,
-                direction=getattr(args, "direction", "both"),
-                remote_board_path=getattr(args, "remote_board_path", "~/.codex/instance-board"),
-                remote_codex_home=getattr(args, "remote_codex_home", ""),
-                local_board_path=getattr(args, "local_board_path", ""),
-                local_codex_home=getattr(args, "local_codex_home", ""),
-                skip_local_refresh=True,
-                skip_remote_refresh=getattr(args, "skip_remote_refresh", False),
-                limit=getattr(args, "limit", 500),
-                quiet=quiet,
-            )
-            synced = sync_state_once(sync_args)
-            last_sync = now
-            if not quiet:
-                peer_labels = [peer["target"] for peer in configured_peers]
-                label = "synced" if synced else "sync had errors"
-                print(f"{dt.datetime.now().strftime('%H:%M:%S')} {label}: {', '.join(peer_labels)}", flush=True)
+            sync_now("interval")
 
         time.sleep(interval)
 
@@ -3297,6 +3934,306 @@ def command_where(_: argparse.Namespace) -> None:
         print(f"PLAN={account.get('plan_type')}")
 
 
+
+def start_of_day(value: dt.datetime) -> dt.datetime:
+    return value.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def format_metric(value: float, suffix: str = "") -> str:
+    if abs(value) >= 1_000_000_000:
+        text = f"{value / 1_000_000_000:.1f}B"
+    elif abs(value) >= 1_000_000:
+        text = f"{value / 1_000_000:.1f}M"
+    elif abs(value) >= 1_000:
+        text = f"{value / 1_000:.1f}K"
+    else:
+        text = str(int(value)) if float(value).is_integer() else f"{value:.1f}"
+    return text + suffix
+
+
+def render_usage_table(title: str, rows: list[tuple[str, str]], width: int = 88) -> list[str]:
+    output = [title, "─" * width]
+    label_width = min(32, max((len(label) for label, _ in rows), default=10))
+    for label, value in rows:
+        output.append(f"{label:{label_width}.{label_width}}  {value}")
+    return output
+
+
+def usage_bar(value: float, maximum: float, width: int = 8) -> str:
+    if maximum <= 0:
+        filled = 0
+    else:
+        filled = max(0, min(width, int(round((value / maximum) * width))))
+    return "█" * filled + "░" * (width - filled)
+
+
+def clip_usage_cell(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text.ljust(width)
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "…"
+
+
+def usage_columns(left: str, right: str = "", width: int = 74) -> str:
+    gap = "  "
+    column_width = max(24, (width - len(gap)) // 2)
+    return clip_usage_cell(left, column_width) + gap + clip_usage_cell(right, column_width)
+
+
+def render_usage_columns(title: str, left_rows: list[str], right_rows: list[str], width: int = 74) -> list[str]:
+    rows = [title, "─" * width]
+    max_rows = max(len(left_rows), len(right_rows))
+    for index in range(max_rows):
+        left = left_rows[index] if index < len(left_rows) else ""
+        right = right_rows[index] if index < len(right_rows) else ""
+        rows.append(usage_columns(left, right, width))
+    return rows
+
+
+def usage_metric_row(label: str, value: float, maximum: float, suffix: str = "", detail: str = "") -> str:
+    text = f"{label} {format_metric(value, suffix)} {usage_bar(value, maximum)}"
+    if detail:
+        text += f" {detail}"
+    return text
+
+
+def dedupe_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    for session in sessions:
+        sid = str(session.get("id") or "")
+        if not sid:
+            sid = f"{session.get('machine_id') or ''}:{session.get('rollout_path') or len(by_id)}"
+        current = by_id.get(sid)
+        if current is None or int(session.get("updated_at") or 0) >= int(current.get("updated_at") or 0):
+            by_id[sid] = session
+    return sorted(by_id.values(), key=lambda row: int(row.get("updated_at") or 0), reverse=True)
+
+
+def project_label_from_cwd(cwd: str) -> str:
+    if not cwd:
+        return "unknown"
+    try:
+        path = Path(cwd.replace("\\\\?\\", ""))
+        return path.name or str(path)
+    except Exception:
+        return cwd
+
+
+def session_token_totals(sessions: list[dict[str, Any]], start_time: int = 0) -> dict[str, float]:
+    keys = ["total_tokens", "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "last_tokens"]
+    totals = {key: 0.0 for key in keys}
+    totals["sessions"] = 0.0
+    totals["active_sessions"] = 0.0
+    totals["context_used_percent"] = 0.0
+    context_count = 0
+    for session in sessions:
+        updated_at = int(session.get("updated_at") or 0)
+        if start_time and updated_at < start_time:
+            continue
+        totals["sessions"] += 1
+        if int(session.get("total_tokens") or 0) > 0:
+            totals["active_sessions"] += 1
+        for key in keys:
+            totals[key] += float(session.get(key) or 0)
+        context = float(session.get("context_used_percent") or 0)
+        if context > 0:
+            totals["context_used_percent"] += context
+            context_count += 1
+    totals["avg_context_used_percent"] = totals["context_used_percent"] / context_count if context_count else 0.0
+    return totals
+
+
+def top_session_groups(sessions: list[dict[str, Any]], key: str, start_time: int = 0, limit: int = 8) -> list[tuple[str, float]]:
+    totals: dict[str, float] = {}
+    for session in sessions:
+        if start_time and int(session.get("updated_at") or 0) < start_time:
+            continue
+        label = str(session.get(key) or "unknown")
+        if key == "cwd":
+            label = project_label_from_cwd(label)
+        totals[label] = totals.get(label, 0.0) + float(session.get("total_tokens") or 0)
+    return [(label, value) for label, value in sorted(totals.items(), key=lambda item: item[1], reverse=True)[:limit] if value > 0]
+
+
+def read_local_thread_stats() -> dict[str, Any]:
+    path = CODEX_HOME / "state_5.sqlite"
+    if not path.exists():
+        return {"available": False}
+    try:
+        with sqlite3.connect(path) as con:
+            total = con.execute("select count(*), coalesce(sum(tokens_used),0), min(created_at), max(updated_at) from threads").fetchone()
+            models = con.execute("select coalesce(model, 'unknown'), count(*), coalesce(sum(tokens_used),0) from threads group by coalesce(model, 'unknown') order by coalesce(sum(tokens_used),0) desc limit 8").fetchall()
+            sources = con.execute("select source, count(*), coalesce(sum(tokens_used),0) from threads group by source order by coalesce(sum(tokens_used),0) desc limit 8").fetchall()
+            return {"available": True, "total": total, "models": models, "sources": sources}
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+
+def read_local_log_stats() -> dict[str, Any]:
+    path = CODEX_HOME / "logs_2.sqlite"
+    if not path.exists():
+        return {"available": False}
+    try:
+        with sqlite3.connect(path) as con:
+            total = con.execute("select count(*), min(ts), max(ts), coalesce(sum(estimated_bytes),0) from logs").fetchone()
+            levels = con.execute("select level, count(*), coalesce(sum(estimated_bytes),0) from logs group by level order by count(*) desc").fetchall()
+            recent_errors = con.execute("select ts, level, target, substr(coalesce(feedback_log_body,''),1,120) from logs where level in ('ERROR','WARN') order by ts desc limit 5").fetchall()
+            return {"available": True, "total": total, "levels": levels, "recent_errors": recent_errors}
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+
+def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 74) -> dict[str, Any]:
+    width = max(44, min(140, width))
+    now = dt.datetime.now().astimezone()
+    today_start = start_of_day(now)
+    week_start = today_start - dt.timedelta(days=today_start.weekday())
+    month_start = today_start.replace(day=1)
+    periods = [("Today", int(today_start.timestamp())), ("This week", int(week_start.timestamp())), ("This month", int(month_start.timestamp())), ("All indexed", 0)]
+    sessions = dedupe_sessions(all_sessions())
+    errors: list[str] = []
+    period_cards: list[list[str]] = []
+    period_json: list[dict[str, Any]] = []
+    for label, start_time in periods:
+        totals = session_token_totals(sessions, start_time)
+        period_cards.append(
+            [
+                f"󰓅 {label:<11} {format_metric(totals['total_tokens'])}",
+                f"  {int(totals['active_sessions'])}/{int(totals['sessions'])} sessions  ctx {totals['avg_context_used_percent']:.1f}%",
+            ]
+        )
+        period_json.append({"label": label, **totals})
+
+    all_totals = session_token_totals(sessions)
+    cache_ratio = (all_totals["cached_input_tokens"] / all_totals["input_tokens"] * 100) if all_totals["input_tokens"] else 0.0
+    output_ratio = (all_totals["output_tokens"] / all_totals["input_tokens"] * 100) if all_totals["input_tokens"] else 0.0
+    reasoning_ratio = (all_totals["reasoning_output_tokens"] / all_totals["output_tokens"] * 100) if all_totals["output_tokens"] else 0.0
+    token_max = max(
+        all_totals["input_tokens"],
+        all_totals["cached_input_tokens"],
+        all_totals["output_tokens"],
+        all_totals["reasoning_output_tokens"],
+        1,
+    )
+    token_mix = [
+        ("Input", format_metric(all_totals["input_tokens"])),
+        ("Cached input", f"{format_metric(all_totals['cached_input_tokens'])} ({cache_ratio:.1f}%)"),
+        ("Output", format_metric(all_totals["output_tokens"])),
+        ("Reasoning output", format_metric(all_totals["reasoning_output_tokens"])),
+        ("Last-turn total", format_metric(all_totals["last_tokens"])),
+    ]
+
+    month_ts = int(month_start.timestamp())
+    top_projects = top_session_groups(sessions, "project_id", month_ts, top)
+    top_models = top_session_groups(sessions, "model", month_ts, top)
+    top_machines = top_session_groups(sessions, "machine_id", month_ts, top)
+    recent_sessions = [
+        (
+            str(session.get("generated_title") or session.get("title") or session.get("id") or "session")[:22],
+            f"{format_metric(float(session.get('total_tokens') or 0))} {session.get('project_id') or 'unknown'}",
+        )
+        for session in sessions[:top]
+    ]
+
+    max_context_session = max(sessions, key=lambda row: float(row.get("context_used_percent") or 0), default={})
+    max_rate_session = max(sessions, key=lambda row: float(row.get("rate_used_percent") or 0), default={})
+    useful_left = [
+        f"󰄬 Cache hit     {cache_ratio:.1f}% {usage_bar(cache_ratio, 100)}",
+        f"󰈸 Output/input  {output_ratio:.2f}% {usage_bar(output_ratio, 10)}",
+        f"󰅟 Reasoning/out {reasoning_ratio:.1f}% {usage_bar(reasoning_ratio, 100)}",
+    ]
+    useful_right = [
+        f"󰯲 Avg context   {all_totals['avg_context_used_percent']:.1f}% {usage_bar(all_totals['avg_context_used_percent'], 100)}",
+        f"󱎫 Peak context  {float(max_context_session.get('context_used_percent') or 0):.1f}% {str(max_context_session.get('project_id') or 'n/a')[:8]}",
+        f"󰍛 Rate pressure {float(max_rate_session.get('rate_used_percent') or 0):.1f}% {str(max_rate_session.get('rate_plan_type') or 'n/a')[:8]}",
+    ]
+
+    period_left = [row for card in period_cards[0::2] for row in card]
+    period_right = [row for card in period_cards[1::2] for row in card]
+    token_left = [
+        usage_metric_row("󰋊 Input       ", all_totals["input_tokens"], token_max),
+        usage_metric_row("󰄬 Cached      ", all_totals["cached_input_tokens"], token_max, detail=f"{cache_ratio:.1f}%"),
+        usage_metric_row("󰈸 Output      ", all_totals["output_tokens"], token_max),
+    ]
+    token_right = [
+        usage_metric_row("󰅟 Reasoning   ", all_totals["reasoning_output_tokens"], token_max),
+        usage_metric_row("󰓅 Last turn   ", all_totals["last_tokens"], max(all_totals["last_tokens"], all_totals["total_tokens"] / max(len(sessions), 1), 1)),
+        f"󰹾 Indexed      {int(all_totals['active_sessions'])}/{int(all_totals['sessions'])} sessions",
+    ]
+    project_max = max((value for _, value in top_projects), default=1)
+    model_max = max((value for _, value in top_models), default=1)
+    machine_max = max((value for _, value in top_machines), default=1)
+    project_rows = [usage_metric_row(f"󰏗 {label:<10}"[:14], value, project_max) for label, value in top_projects[:top]]
+    model_rows = [usage_metric_row(f"󰚩 {label:<10}"[:14], value, model_max) for label, value in top_models[:top]]
+    machine_rows = [usage_metric_row(f" {label:<10}"[:14], value, machine_max) for label, value in top_machines[:top]]
+    recent_rows = [f"󰈙 {label:<22} {value}" for label, value in recent_sessions[:top]]
+
+    lines = [
+        "Local Codex Usage",
+        f"󰋊 {CODEX_HOME}",
+        f"󰉋 {BOARD_HOME}",
+        f"Updated: {now.strftime('%Y-%m-%d %H:%M %Z')}",
+        "",
+        *render_usage_columns("󰓅 Session Tokens", period_left, period_right, width),
+        "",
+        *render_usage_columns("󰋊 Token Mix", token_left, token_right, width),
+        "",
+        *render_usage_columns("󰌵 Useful Signals", useful_left, useful_right, width),
+    ]
+    if project_rows or model_rows:
+        lines.extend(["", *render_usage_columns("󰏗 Leaders This Month", project_rows, model_rows, width)])
+    if machine_rows or recent_rows:
+        lines.extend(["", *render_usage_columns(" Machines / Recent", machine_rows, recent_rows, width)])
+
+    thread_stats = read_local_thread_stats()
+    state_rows: list[str] = []
+    if thread_stats.get("available"):
+        count, total_tokens, _created, _updated = thread_stats.get("total") or (0, 0, 0, 0)
+        state_rows.extend(
+            [
+                f"󰒋 Threads      {count}",
+                f"󰓅 tokens_used  {format_metric(float(total_tokens or 0))}",
+            ]
+        )
+        model_rows = [(str(label), f"{format_metric(float(tokens or 0))}  {count} threads") for label, count, tokens in thread_stats.get("models", [])[:top]]
+        if model_rows:
+            state_rows.extend(f"󰚩 {label[:12]:<12} {value}" for label, value in model_rows[:3])
+    elif thread_stats.get("error"):
+        errors.append(f"state_5.sqlite: {thread_stats['error']}")
+
+    log_stats = read_local_log_stats()
+    log_rows: list[str] = []
+    if log_stats.get("available"):
+        count, _min_ts, _max_ts, estimated_bytes = log_stats.get("total") or (0, 0, 0, 0)
+        level_rows = [(str(level), f"{count} events  {format_metric(float(size or 0), 'B')}") for level, count, size in log_stats.get("levels", [])]
+        log_rows.extend(
+            [
+                f"󰌱 Events       {count}",
+                f"󰈙 Est bytes    {format_metric(float(estimated_bytes or 0), 'B')}",
+            ]
+        )
+        log_rows.extend(f"󰑭 {level[:5]:<5} {value}" for level, value in level_rows[:4])
+    elif log_stats.get("error"):
+        errors.append(f"logs_2.sqlite: {log_stats['error']}")
+    if state_rows or log_rows:
+        lines.extend(["", *render_usage_columns("󰒋 Local DB / Logs", state_rows, log_rows, width)])
+
+    if errors and show_errors:
+        lines.extend(["", *render_usage_table("Local read errors", [(str(i + 1), error) for i, error in enumerate(errors)], width)])
+
+    return {"lines": lines, "periods": period_json, "capabilities": token_mix, "errors": errors, "sessions": len(sessions)}
+
+
+def command_usage(args: argparse.Namespace) -> None:
+    terminal_width = max(44, min(140, os.get_terminal_size().columns - 6)) if sys.stdout.isatty() else 74
+    dashboard = build_usage_dashboard(top=args.top, show_errors=args.show_errors, width=terminal_width)
+    if args.json:
+        print(json.dumps({"periods": dashboard["periods"], "token_mix": dashboard["capabilities"], "errors": dashboard["errors"], "sessions": dashboard["sessions"]}, indent=2))
+    else:
+        print("\n".join(dashboard["lines"]))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codex-board",
@@ -3306,7 +4243,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tui", action="store_true", help="Force the interactive terminal dashboard")
     parser.add_argument("--per-group", type=int, default=20, help="Plain output sessions per subproject")
     parser.add_argument("--limit", type=int, default=500, help="Refresh limit used by the dashboard")
-    parser.add_argument("--auto-refresh", type=int, default=10, help="TUI auto-refresh interval in seconds; 0 disables it")
+    parser.add_argument("--auto-refresh", type=int, default=2, help="Fallback TUI refresh interval in seconds; 0 disables it")
     sub = parser.add_subparsers(dest="command")
 
     dashboard = sub.add_parser("dashboard", help="Open the interactive terminal dashboard")
@@ -3314,7 +4251,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--tui", action="store_true", help="Force the interactive terminal dashboard")
     dashboard.add_argument("--per-group", type=int, default=20, help="Plain output sessions per subproject")
     dashboard.add_argument("--limit", type=int, default=500, help="Refresh limit")
-    dashboard.add_argument("--auto-refresh", type=int, default=10, help="TUI auto-refresh interval in seconds; 0 disables it")
+    dashboard.add_argument("--auto-refresh", type=int, default=2, help="Fallback TUI refresh interval in seconds; 0 disables it")
     dashboard.set_defaults(func=command_dashboard)
 
     refresh = sub.add_parser("refresh", help="Export this machine's Codex session index and heartbeat")
@@ -3382,12 +4319,12 @@ def build_parser() -> argparse.ArgumentParser:
     sync.set_defaults(func=command_sync)
 
     watch = sub.add_parser("watch", help="Watch local Codex state and optionally sync remote board JSON")
-    watch.add_argument("--interval", type=float, default=1.0, help="Polling interval for local Codex state")
-    watch.add_argument("--debounce", type=float, default=0.75, help="Delay after a file change before refreshing")
+    watch.add_argument("--interval", type=float, default=0.2, help="Polling interval for local Codex state")
+    watch.add_argument("--debounce", type=float, default=0.15, help="Delay after a file change before refreshing")
     watch.add_argument("--heartbeat", type=float, default=5.0, help="Refresh at least this often, even without file changes")
     watch.add_argument("--limit", type=int, default=500)
     watch.add_argument("--sync-target", dest="targets", action="append", default=[], help="SSH target to sync; repeat for multiple machines")
-    watch.add_argument("--sync-interval", type=float, default=10.0, help="Seconds between sync attempts when targets are configured")
+    watch.add_argument("--sync-interval", type=float, default=2.0, help="Seconds between sync attempts when targets are configured")
     watch.add_argument("--direction", choices=["push", "pull", "both"], default="both")
     watch.add_argument("--remote-board-path", default="~/.codex/instance-board")
     watch.add_argument("--remote-codex-home", default="", help="CODEX_HOME to use during remote refresh")
@@ -3399,6 +4336,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     where = sub.add_parser("where", help="Print paths and machine identity")
     where.set_defaults(func=command_where)
+
+    usage = sub.add_parser("usage", help="Show local Codex usage dashboard")
+    usage.add_argument("--top", type=int, default=8, help="Rows to show in top project/model/session tables")
+    usage.add_argument("--json", action="store_true", help="Print machine-readable summary JSON")
+    usage.add_argument("--show-errors", action="store_true", help="Show local sources that could not be read")
+    usage.set_defaults(func=command_usage)
 
     parser.set_defaults(func=command_dashboard)
     return parser
