@@ -3085,20 +3085,35 @@ class AnsiDashboardApp:
         rows: list[str] = []
         current = ""
         inner_width = max(1, body_width - 4)
-        key_width = min(18, max(9, inner_width // 4))
-        desc_width = max(12, inner_width - key_width - 1)
+        card_width = max(16, inner_width - 2)
+        card_inner = max(1, card_width - 4)
+        key_width = min(18, max(9, card_inner // 4))
+        desc_width = max(12, card_inner - key_width - 1)
+
+        def group_top(label: str) -> str:
+            title = f" {label} "
+            return "╭" + title + "─" * max(0, card_width - self.visible_len(title) - 2) + "╮"
+
+        def group_bottom() -> str:
+            return "╰" + "─" * max(0, card_width - 2) + "╯"
+
+        def group_row(content: str) -> str:
+            return "│ " + self.fit_ansi(content, card_inner) + " │"
+
         for group, keys, description in KEY_BINDINGS:
             if group != current:
                 if current:
+                    rows.append(self.pane_row(" " + self.color(group_bottom(), "38;2;76;154;180"), body_width, "38;2;126;203;255"))
                     rows.append(self.pane_row("", body_width, "38;2;126;203;255"))
                 current = group
-                rows.append(self.pane_row(self.color(group, "38;2;245;194;96;1"), body_width, "38;2;126;203;255"))
-                rows.append(self.pane_row(self.color("─" * inner_width, "38;2;76;154;180"), body_width, "38;2;126;203;255"))
+                rows.append(self.pane_row(" " + self.color(group_top(group), "38;2;76;154;180"), body_width, "38;2;126;203;255"))
             wrapped = textwrap.wrap(description, width=desc_width, break_long_words=False, break_on_hyphens=False) or [""]
             content = self.color(f"{keys:<{key_width}.{key_width}}", "38;2;126;203;255;1") + " " + wrapped[0]
-            rows.append(self.pane_row(content, body_width, "38;2;126;203;255"))
+            rows.append(self.pane_row(" " + group_row(content), body_width, "38;2;126;203;255"))
             for extra in wrapped[1:]:
-                rows.append(self.pane_row(" " * (key_width + 1) + extra, body_width, "38;2;126;203;255"))
+                rows.append(self.pane_row(" " + group_row(" " * (key_width + 1) + extra), body_width, "38;2;126;203;255"))
+        if current:
+            rows.append(self.pane_row(" " + self.color(group_bottom(), "38;2;76;154;180"), body_width, "38;2;126;203;255"))
         return rows
 
     def modal_dimensions(self, content_rows: list[str] | None = None, preferred_width: int = 0) -> tuple[int, int]:
@@ -3167,6 +3182,36 @@ class AnsiDashboardApp:
         else:
             raw_rows = ["Press u to load local Codex usage stats."]
         rows = []
+        section_color = "38;2;220;224;232"
+
+        def usage_color(raw: str, heading: bool = False, rule: bool = False) -> str:
+            nonlocal section_color
+            if "Session Tokens" in raw:
+                section_color = "38;2;126;203;255"
+            elif "Token Mix" in raw:
+                section_color = "38;2;92;214;144"
+            elif "Useful Signals" in raw:
+                section_color = "38;2;245;194;96"
+            elif "Leaders" in raw:
+                section_color = "38;2;174;141;255"
+            elif "Machines" in raw or "Recent" in raw:
+                section_color = "38;2;126;203;255"
+            elif "Local DB" in raw or "Logs" in raw:
+                section_color = "38;2;150;158;171"
+            if heading:
+                return "38;2;245;194;96;1"
+            if rule:
+                return "38;2;76;154;180"
+            if raw.startswith("╭") or raw.startswith("╰") or raw.startswith("│"):
+                return section_color
+            if "Rate pressure" in raw or "Peak context" in raw:
+                return "38;2;245;108;108"
+            if "Cache" in raw or "Cached" in raw:
+                return "38;2;92;214;144"
+            if raw.startswith("Updated:") or str(CODEX_HOME) in raw or str(BOARD_HOME) in raw:
+                return "38;2;150;158;171"
+            return "38;2;220;224;232"
+
         for index, raw in enumerate(raw_rows):
             if not raw:
                 rows.append(self.pane_row("", body_width, "38;2;126;203;255"))
@@ -3174,13 +3219,9 @@ class AnsiDashboardApp:
             next_raw = raw_rows[index + 1] if index + 1 < len(raw_rows) else ""
             is_heading = raw == "Local Codex Usage" or (next_raw and set(next_raw) in ({"-"}, {"─"}))
             is_rule = set(raw) in ({"-"}, {"─"})
-            if is_heading:
-                color = "38;2;245;194;96;1"
-            elif is_rule:
-                color = "38;2;76;154;180"
+            color = usage_color(raw, heading=is_heading, rule=is_rule)
+            if is_rule:
                 raw = "─" * inner_width
-            else:
-                color = "38;2;220;224;232"
             rows.append(self.pane_row(self.color(raw, color), body_width, "38;2;126;203;255"))
         return rows
 
