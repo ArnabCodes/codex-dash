@@ -34,6 +34,7 @@ SUMMARIES_PATH = BOARD_HOME / "summaries.json"
 PROJECTS_DIR = BOARD_HOME / "projects"
 LAUNCHES_PATH = BOARD_HOME / "launches.json"
 PEERS_PATH = BOARD_HOME / "peers.json"
+DELETED_SESSIONS_PATH = BOARD_HOME / "deleted_sessions.json"
 RECENT_SECONDS = 7 * 24 * 60 * 60
 HEARTBEAT_SECONDS = 120
 TEMPERATURE_REFRESH_SECONDS = 30
@@ -314,6 +315,29 @@ def load_launches() -> dict[str, Any]:
 def save_launches(data: dict[str, Any]) -> None:
     LAUNCHES_PATH.parent.mkdir(parents=True, exist_ok=True)
     LAUNCHES_PATH.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def load_deleted_sessions() -> dict[str, Any]:
+    if not DELETED_SESSIONS_PATH.exists():
+        return {"sessions": {}}
+    try:
+        data = json.loads(DELETED_SESSIONS_PATH.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {"sessions": {}}
+    if not isinstance(data, dict):
+        return {"sessions": {}}
+    sessions = data.get("sessions")
+    data["sessions"] = sessions if isinstance(sessions, dict) else {}
+    return data
+
+
+def save_deleted_sessions(data: dict[str, Any]) -> None:
+    DELETED_SESSIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DELETED_SESSIONS_PATH.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def deleted_session_ids() -> set[str]:
+    return {str(key) for key in load_deleted_sessions().get("sessions", {})}
 
 
 def load_peers() -> dict[str, Any]:
@@ -952,11 +976,14 @@ def export_state(args: argparse.Namespace) -> None:
     current_machine = machine_id()
     exported = []
     now = int(time.time())
+    hidden_ids = deleted_session_ids()
     summary_cache = load_summaries()
     cached_sessions = summary_cache.setdefault("sessions", {})
     launches = load_launches().get("sessions", {})
     current_account = load_current_account()
     for thread in threads:
+        if str(thread.get("id") or "") in hidden_ids:
+            continue
         project_id, subproject_id = classify_thread(thread, manifest)
         title = thread.get("title") or thread.get("first_user_message") or thread.get("preview") or ""
         updated_at = int(thread.get("updated_at") or 0)
@@ -1319,10 +1346,13 @@ def read_json_files(folder: Path) -> list[dict[str, Any]]:
 def all_sessions() -> list[dict[str, Any]]:
     assignments = load_assignments().get("sessions", {})
     launches = load_launches().get("sessions", {})
+    hidden_ids = deleted_session_ids()
     sessions = []
     for payload in read_json_files(SESSIONS_DIR):
         for session in payload.get("sessions", []):
             session_id = session.get("id")
+            if session_id and str(session_id) in hidden_ids:
+                continue
             assigned = assignments.get(session_id) if session_id else None
             if isinstance(assigned, dict):
                 session = dict(session)
@@ -1783,7 +1813,9 @@ KEY_BINDINGS: list[tuple[str, str, str]] = [
     ("Projects", "p", "Assign selected session to current/project id"),
     ("Actions", "r", "Refresh local session export"),
     ("Actions", "u", "Show local Codex usage stats"),
+    ("Actions", "N", "Open a new Codex session in a terminal"),
     ("Actions", "Enter", "Open selected session in a terminal"),
+    ("Actions", "d", "Hide selected broken session from dashboard"),
     ("Actions", "o", "Open/attach selected tmux or SSH session when metadata exists"),
     ("Actions", "?", "Show or hide this help"),
     ("Actions", "Esc", "Back: close help/search or clear active filters"),
@@ -2712,9 +2744,11 @@ class AnsiDashboardApp:
         cpu_max = self.temperature_status.get("cpu_max")
         gpu_hotspot = self.temperature_status.get("gpu_hotspot")
         if cpu_max is not None:
-            parts.append(self.color(f" cpu max {cpu_max:.0f}C", "38;2;245;194;96"))
+            color = "38;2;245;108;108;1" if cpu_max >= 95 else "38;2;238;241;245;1"
+            parts.append(self.color(f" cpu max {cpu_max:.0f}C", color))
         if gpu_hotspot is not None:
-            parts.append(self.color(f" gpu hot {gpu_hotspot:.0f}C", "38;2;245;108;108"))
+            color = "38;2;245;108;108;1" if gpu_hotspot >= 100 else "38;2;238;241;245;1"
+            parts.append(self.color(f" gpu hot {gpu_hotspot:.0f}C", color))
         return " ".join(parts)
 
     def temperature_header_segments(self, width: int) -> str:
@@ -2723,9 +2757,11 @@ class AnsiDashboardApp:
         gpu_hotspot = self.temperature_status.get("gpu_hotspot")
         parts = []
         if cpu_max is not None:
-            parts.append(self.color(f"  {cpu_max:.0f}C ", "38;2;245;194;96;1"))
+            color = "38;2;245;108;108;1" if cpu_max >= 95 else "38;2;238;241;245;1"
+            parts.append(self.color(f"  {cpu_max:.0f}C ", color))
         if gpu_hotspot is not None:
-            parts.append(self.color(f" 󰢮 {gpu_hotspot:.0f}C ", "38;2;245;108;108;1"))
+            color = "38;2;245;108;108;1" if gpu_hotspot >= 100 else "38;2;238;241;245;1"
+            parts.append(self.color(f" 󰢮 {gpu_hotspot:.0f}C ", color))
         return " ".join(parts)
 
     def plan_progress_label(self, session: dict[str, Any], width: int) -> str:
@@ -3231,6 +3267,26 @@ class AnsiDashboardApp:
             return
         self.attach_id = str(session["id"])
 
+    def open_new_session(self) -> None:
+        session = self.current()
+        cwd = str(session.get("cwd") or "") if session else ""
+        ok, message = open_new_session_terminal(cwd or None)
+        self.message = message if ok else f"Open failed: {message}"
+
+    def delete_current_session(self) -> None:
+        session = self.current()
+        if not session:
+            self.message = "No session selected"
+            return
+        session_id = str(session.get("id") or "")
+        if not session_id:
+            self.message = "Selected session has no id"
+            return
+        removed = soft_delete_session(session_id, "hidden from dashboard via TUI")
+        self.reload(quiet=True)
+        self.cursor = min(self.cursor, max(0, len(self.visible) - 1))
+        self.message = f"Hidden session {short_title(session_id, 18)} ({removed} row(s))"
+
     def finish_assign(self, project_id: str) -> None:
         session = self.current()
         if not session:
@@ -3700,10 +3756,14 @@ class AnsiDashboardApp:
                     self.cycle_status(1)
                 elif key == "S":
                     self.cycle_sort()
+                elif key == "N":
+                    self.open_new_session()
                 elif key == "c":
                     self.prompt_create_project()
                 elif key == "p":
                     self.assign_current_to_project()
+                elif key == "d":
+                    self.delete_current_session()
                 elif key == "o":
                     self.open_current_attach()
                     if self.attach_id:
@@ -3862,11 +3922,62 @@ def open_session_terminal(session: dict[str, Any]) -> tuple[bool, str]:
     return True, f"{label}: {short_title(title, 60)}"
 
 
+def open_new_session_terminal(cwd: str | None = None) -> tuple[bool, str]:
+    workdir = cwd or os.getcwd()
+    command = f"codex --cd {shell_quote(workdir)}"
+    try:
+        code = open_terminal_command(command, "new codex session")
+    except Exception as exc:
+        return False, str(exc)
+    if code not in (0, None):
+        return False, f"terminal command exited with {code}"
+    return True, f"opened new session: {short_title(workdir, 60)}"
+
+
+def remove_session_from_exports(session_id: str) -> int:
+    removed = 0
+    for path in SESSIONS_DIR.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+        sessions = payload.get("sessions")
+        if not isinstance(sessions, list):
+            continue
+        kept = [session for session in sessions if str(session.get("id") or "") != session_id]
+        removed += len(sessions) - len(kept)
+        if len(kept) != len(sessions):
+            payload["sessions"] = kept
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return removed
+
+
+def soft_delete_session(session_id: str, reason: str = "hidden from dashboard") -> int:
+    data = load_deleted_sessions()
+    sessions = data.setdefault("sessions", {})
+    sessions[session_id] = {"deleted_at": now_utc(), "reason": reason}
+    save_deleted_sessions(data)
+    return remove_session_from_exports(session_id)
+
+
 def command_open_session(args: argparse.Namespace) -> None:
     target = find_session_by_prefix(args.session_id)
     ok, message = open_session_terminal(target)
     print(message)
     raise SystemExit(0 if ok else 1)
+
+
+def command_new_session(args: argparse.Namespace) -> None:
+    ok, message = open_new_session_terminal(getattr(args, "cwd", "") or None)
+    print(message)
+    raise SystemExit(0 if ok else 1)
+
+
+def command_delete_session(args: argparse.Namespace) -> None:
+    target = find_session_by_prefix(args.session_id)
+    session_id = str(target.get("id") or args.session_id)
+    removed = soft_delete_session(session_id, getattr(args, "reason", "") or "hidden from dashboard")
+    print(f"Hidden {session_id} from codex-dash ({removed} exported row(s) removed).")
 
 
 def command_attach(args: argparse.Namespace) -> None:
@@ -4407,6 +4518,10 @@ def build_parser() -> argparse.ArgumentParser:
     pick.add_argument("--limit", type=int, default=30, help="Maximum sessions to show")
     pick.set_defaults(func=command_pick)
 
+    new = sub.add_parser("new", help="Open a new Codex session in a terminal")
+    new.add_argument("--cwd", default="", help="Working directory for the new Codex session")
+    new.set_defaults(func=command_new_session)
+
     resume = sub.add_parser("resume", help="Resume a session by full id or unique prefix")
     resume.add_argument("session_id")
     resume.set_defaults(func=command_resume)
@@ -4414,6 +4529,11 @@ def build_parser() -> argparse.ArgumentParser:
     open_cmd = sub.add_parser("open", help="Open or attach a session in a terminal")
     open_cmd.add_argument("session_id")
     open_cmd.set_defaults(func=command_open_session)
+
+    delete = sub.add_parser("delete", help="Hide a broken session from the dashboard")
+    delete.add_argument("session_id")
+    delete.add_argument("--reason", default="")
+    delete.set_defaults(func=command_delete_session)
 
     attach = sub.add_parser("attach", help="Run the recorded attach command for a tmux/SSH session")
     attach.add_argument("session_id")

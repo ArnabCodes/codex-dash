@@ -96,8 +96,10 @@ Common keys:
 - `c`: create a project and Markdown context file
 - `p`: assign selected session to the current/project id
 - `r`: refresh local session export in the background
+- `N`: open a new Codex session in a terminal
 - `o`: open/attach selected SSH or tmux session when metadata exists
 - `Enter`: open selected session in a terminal
+- `d`: hide a broken session from the dashboard
 - `?`: show key overlay
 - `Esc`: go back, close search/help, or clear active filters
 - `q`: quit
@@ -197,8 +199,10 @@ codex-dash refresh
 codex-dash list
 codex-dash keys
 codex-dash pick
+codex-dash new
 codex-dash open <session-id-or-prefix>
 codex-dash resume <session-id-or-prefix>
+codex-dash delete <session-id-or-prefix>
 codex-dash attach <session-id-or-prefix>
 codex-dash sync <ssh-target>
 codex-dash watch --sync-target <ssh-target>

@@ -19,6 +19,7 @@ assignments.json
 launches.json
 projects.yaml
 peers.json
+deleted_sessions.json
 
 # Local packaging/editor state.
 .idea/
