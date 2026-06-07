@@ -3236,11 +3236,11 @@ class AnsiDashboardApp:
             return self.color(raw, color)
         muted = "38;2;88;96;108"
         bar_pairs = {
-            "▓": "░",
+            "━": "─",
             "█": "░",
-            "â–“": "â–‘",
+            "â”": "â”€",
             "â–ˆ": "â–‘",
-            "Ã¢â€“â€œ": "Ã¢â€“â€˜",
+            "Ã¢â€Â": "Ã¢â€â‚¬",
             "Ã¢â€“Ë†": "Ã¢â€“â€˜",
         }
         singles = {glyph for pair in bar_pairs.items() for glyph in pair}
@@ -3252,7 +3252,7 @@ class AnsiDashboardApp:
                 parts.append(self.color(raw[index : match.start()], color))
             glyph = match.group(0)
             is_filled = glyph in bar_pairs
-            parts.append(self.color("▓", accent if is_filled else muted))
+            parts.append(self.color("━", accent if is_filled else muted))
             index = match.end()
         if index < len(raw):
             parts.append(self.color(raw[index:], color))
@@ -4449,7 +4449,7 @@ def usage_bar(value: float, maximum: float, width: int = USAGE_BAR_WIDTH) -> str
         filled = 0
     else:
         filled = max(0, min(width, int(round((value / maximum) * width))))
-    return "▓" * filled + "░" * (width - filled)
+    return "━" * filled + "─" * (width - filled)
 
 
 def clip_usage_cell(text: str, width: int) -> str:
