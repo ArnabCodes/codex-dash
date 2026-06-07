@@ -3054,11 +3054,11 @@ class AnsiDashboardApp:
         min_width = min(max_width, 42)
         content_width = preferred_width
         if content_rows:
-            content_width = max(content_width, max((self.visible_len(row) for row in content_rows), default=0) + 4)
+            content_width = max(content_width, max((self.visible_len(row) for row in content_rows), default=0))
         modal_width = min(max_width, max(min_width, content_width))
         max_height = max(6, min(height - 4, 28))
         min_height = min(max_height, 8)
-        desired_height = (len(content_rows) if content_rows is not None else max_height) + 3
+        desired_height = (len(content_rows) if content_rows is not None else max_height) + 5
         modal_height = min(max_height, max(min_height, desired_height))
         return modal_width, modal_height
 
@@ -3071,13 +3071,15 @@ class AnsiDashboardApp:
         if base_rows:
             base_rows[0] = base_rows[0].replace("\x1b[?25l\x1b[H", "", 1)
         body_width, modal_height = self.modal_dimensions(content_rows, preferred_width=self.visible_len(title) + 10)
-        content_height = max(1, modal_height - 3)
+        content_height = max(1, modal_height - 5)
         max_top = max(0, len(content_rows) - content_height)
         scroll_top = min(max(0, scroll_top), max_top)
 
         rows = [self.color(self.plain_box(body_width, title), border + ";1")]
+        rows.append(self.pane_row("", body_width, border))
         rows.extend(content_rows[scroll_top : scroll_top + content_height])
-        rows.extend(self.pane_row("", body_width, "38;2;126;203;255") for _ in range(max(0, content_height - (len(rows) - 1))))
+        rows.extend(self.pane_row("", body_width, border) for _ in range(max(0, content_height - (len(rows) - 2))))
+        rows.append(self.pane_row("", body_width, border))
         position = f"{scroll_top + 1}-{min(len(content_rows), scroll_top + content_height)}/{len(content_rows)}" if content_rows else "0/0"
         hint = self.color(f" {hint_left}  j/k scroll  Up/Down scroll  Esc back  q quit  {position} ", "38;2;24;31;44;48;2;126;203;255;1")
         rows.append(self.pane_row(hint, body_width, border))
@@ -4217,12 +4219,17 @@ def usage_columns(left: str, right: str = "", width: int = 74) -> str:
 
 
 def render_usage_columns(title: str, left_rows: list[str], right_rows: list[str], width: int = 74) -> list[str]:
-    rows = [title, "─" * width]
+    width = max(24, width)
+    label = f" {title} "
+    top = "╭" + label + "─" * max(0, width - len(label) - 2) + "╮"
+    bottom = "╰" + "─" * max(0, width - 2) + "╯"
+    rows = [top]
     max_rows = max(len(left_rows), len(right_rows))
     for index in range(max_rows):
         left = left_rows[index] if index < len(left_rows) else ""
         right = right_rows[index] if index < len(right_rows) else ""
-        rows.append(usage_columns(left, right, width))
+        rows.append("│ " + clip_usage_cell(usage_columns(left, right, max(1, width - 4)), max(1, width - 4)) + " │")
+    rows.append(bottom)
     return rows
 
 
