@@ -3089,6 +3089,8 @@ class AnsiDashboardApp:
         card_inner = max(1, card_width - 4)
         key_width = min(18, max(9, card_inner // 4))
         desc_width = max(12, card_inner - key_width - 1)
+        outer_border = "38;2;126;203;255;1"
+        section_border = "38;2;76;154;180"
 
         def group_top(label: str) -> str:
             title = f" {label} "
@@ -3098,22 +3100,22 @@ class AnsiDashboardApp:
             return "╰" + "─" * max(0, card_width - 2) + "╯"
 
         def group_row(content: str) -> str:
-            return "│ " + self.fit_ansi(content, card_inner) + " │"
+            return self.color("│", section_border) + " " + self.fit_ansi(content, card_inner) + " " + self.color("│", section_border)
 
         for group, keys, description in KEY_BINDINGS:
             if group != current:
                 if current:
-                    rows.append(self.pane_row(" " + self.color(group_bottom(), "38;2;76;154;180"), body_width, "38;2;126;203;255"))
-                    rows.append(self.pane_row("", body_width, "38;2;126;203;255"))
+                    rows.append(self.pane_row(" " + self.color(group_bottom(), section_border), body_width, outer_border))
+                    rows.append(self.pane_row("", body_width, outer_border))
                 current = group
-                rows.append(self.pane_row(" " + self.color(group_top(group), "38;2;76;154;180"), body_width, "38;2;126;203;255"))
+                rows.append(self.pane_row(" " + self.color(group_top(group), section_border), body_width, outer_border))
             wrapped = textwrap.wrap(description, width=desc_width, break_long_words=False, break_on_hyphens=False) or [""]
             content = self.color(f"{keys:<{key_width}.{key_width}}", "38;2;126;203;255;1") + " " + wrapped[0]
-            rows.append(self.pane_row(" " + group_row(content), body_width, "38;2;126;203;255"))
+            rows.append(self.pane_row(" " + group_row(content), body_width, outer_border))
             for extra in wrapped[1:]:
-                rows.append(self.pane_row(" " + group_row(" " * (key_width + 1) + extra), body_width, "38;2;126;203;255"))
+                rows.append(self.pane_row(" " + group_row(" " * (key_width + 1) + extra), body_width, outer_border))
         if current:
-            rows.append(self.pane_row(" " + self.color(group_bottom(), "38;2;76;154;180"), body_width, "38;2;126;203;255"))
+            rows.append(self.pane_row(" " + self.color(group_bottom(), section_border), body_width, outer_border))
         return rows
 
     def modal_dimensions(self, content_rows: list[str] | None = None, preferred_width: int = 0) -> tuple[int, int]:
