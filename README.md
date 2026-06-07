@@ -97,7 +97,7 @@ Common keys:
 - `p`: assign selected session to the current/project id
 - `r`: refresh local session export in the background
 - `o`: open/attach selected SSH or tmux session when metadata exists
-- `Enter`: resume selected session
+- `Enter`: open selected session in a terminal
 - `?`: show key overlay
 - `Esc`: go back, close search/help, or clear active filters
 - `q`: quit
@@ -197,6 +197,7 @@ codex-dash refresh
 codex-dash list
 codex-dash keys
 codex-dash pick
+codex-dash open <session-id-or-prefix>
 codex-dash resume <session-id-or-prefix>
 codex-dash attach <session-id-or-prefix>
 codex-dash sync <ssh-target>

@@ -4,17 +4,21 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import gzip
 import json
 import os
 import platform
 import re
+import shutil
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
 import time
 import textwrap
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +113,47 @@ $gpuHotspot = ($rows | Where-Object {{ $_.HardwareType -like 'Gpu*' }} | Where-O
         "-Command",
         script,
     ]
+
+
+def lhm_config_cpu_temperature(max_age_seconds: int = 900) -> float | None:
+    config_path = Path(os.environ.get("LIBRE_HARDWARE_MONITOR_CONFIG", LHM_WINGET_PACKAGE / "LibreHardwareMonitor.config"))
+    if not config_path.exists():
+        return None
+    try:
+        if time.time() - config_path.stat().st_mtime > max_age_seconds:
+            return None
+        root = ET.parse(config_path).getroot()
+    except Exception:
+        return None
+    latest_values: list[float] = []
+    for node in root.findall(".//add"):
+        key = node.attrib.get("key", "")
+        value = node.attrib.get("value", "")
+        match = re.fullmatch(r"/intelcpu/0/temperature/(\d+)/values", key)
+        if not match or not value:
+            continue
+        sensor_index = int(match.group(1))
+        # LHM orders Intel CPU temperatures as Core Max, Core Average, core temps,
+        # CPU Package, then Distance to TjMax. The distance sensors are not temps.
+        if sensor_index > 62:
+            continue
+        try:
+            raw = gzip.decompress(base64.b64decode(value))
+        except Exception:
+            continue
+        values = []
+        for offset in range(8, len(raw) - 3, 12):
+            try:
+                candidate = struct.unpack_from("<f", raw, offset)[0]
+            except struct.error:
+                continue
+            if -20.0 <= candidate <= 125.0:
+                values.append(candidate)
+        if values:
+            latest_values.append(values[-1])
+    if not latest_values:
+        return None
+    return round(max(latest_values), 1)
 
 
 def normalize_path(value: str | None) -> str:
@@ -1738,7 +1783,7 @@ KEY_BINDINGS: list[tuple[str, str, str]] = [
     ("Projects", "p", "Assign selected session to current/project id"),
     ("Actions", "r", "Refresh local session export"),
     ("Actions", "u", "Show local Codex usage stats"),
-    ("Actions", "Enter", "Resume selected session"),
+    ("Actions", "Enter", "Open selected session in a terminal"),
     ("Actions", "o", "Open/attach selected tmux or SSH session when metadata exists"),
     ("Actions", "?", "Show or hide this help"),
     ("Actions", "Esc", "Back: close help/search or clear active filters"),
@@ -1824,6 +1869,7 @@ class DashboardApp:
         self.sessions: list[dict[str, Any]] = []
         self.visible: list[dict[str, Any]] = []
         self.resume_id: str | None = None
+        self.open_id: str | None = None
         self.manifest: dict[str, Any] = {"projects": []}
         self.machines: dict[str, dict[str, Any]] = {}
         self.names: dict[str, str] = {}
@@ -1861,7 +1907,7 @@ class DashboardApp:
         if not session:
             self.message = "No session selected"
             return
-        self.resume_id = session["id"]
+        self.open_id = session["id"]
 
     def prompt_search(self) -> None:
         import curses
@@ -2147,7 +2193,7 @@ class DashboardApp:
                     self.message = f"Refresh failed: {exc}"
             elif key in (ord("\n"), ord("\r"), curses.KEY_ENTER):
                 self.resume_current()
-                if self.resume_id:
+                if self.open_id:
                     return
 
 
@@ -2179,6 +2225,7 @@ class AnsiDashboardApp:
         self.sort_mode = "updated"
         self.resume_id: str | None = None
         self.attach_id: str | None = None
+        self.open_id: str | None = None
         self.spinner_index = 0
         self.auto_refresh_interval = max(0, int(getattr(args, "auto_refresh", 10) or 0))
         self.last_auto_refresh = 0.0
@@ -2630,6 +2677,10 @@ class AnsiDashboardApp:
                 value = parsed.get(key)
                 if isinstance(value, (int, float)):
                     status[key] = float(value)
+            if "cpu_max" not in status:
+                fallback_cpu = lhm_config_cpu_temperature()
+                if fallback_cpu is not None:
+                    status["cpu_max"] = fallback_cpu
             if status:
                 self.temperature_status.update(status)
 
@@ -3678,7 +3729,7 @@ class AnsiDashboardApp:
                 elif key in ("\r", "\n"):
                     session = self.current()
                     if session:
-                        self.resume_id = session["id"]
+                        self.open_id = session["id"]
                         return
         finally:
             print("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h", end="", flush=True)
@@ -3688,6 +3739,9 @@ class AnsiDashboardApp:
 def run_ansi_dashboard(args: argparse.Namespace) -> None:
     app = AnsiDashboardApp(args)
     app.run()
+    if app.open_id:
+        args.session_id = app.open_id
+        command_open_session(args)
     if app.attach_id:
         args.session_id = app.attach_id
         command_attach(args)
@@ -3728,7 +3782,10 @@ def command_dashboard(args: argparse.Namespace) -> None:
         args.per_group = args.per_group or 20
         command_list(args)
         return
-    if app and app.resume_id:
+    if app and app.open_id:
+        args.session_id = app.open_id
+        command_open_session(args)
+    elif app and app.resume_id:
         args.session_id = app.resume_id
         command_resume(args)
 
@@ -3749,6 +3806,61 @@ def run_shell_command(command: str) -> int:
     if platform.system().lower() == "windows":
         return subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command]).returncode
     return subprocess.run(command, shell=True).returncode
+
+
+def shell_quote(value: str) -> str:
+    if platform.system().lower() == "windows":
+        return json.dumps(value)
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def session_ssh_target(session: dict[str, Any]) -> str:
+    machine = str(session.get("machine_id") or "").strip()
+    if machine and machine != machine_id():
+        return machine
+    hint = str(session.get("origin_hint") or "").strip()
+    if hint and hint not in {machine_id(), "local"}:
+        return hint
+    return machine
+
+
+def resume_command_for_session(session: dict[str, Any]) -> str:
+    session_id = str(session.get("id") or "")
+    if session.get("machine_id") and session.get("machine_id") != machine_id():
+        target = session_ssh_target(session)
+        if target:
+            return f"ssh -t {shell_quote(target)} {shell_quote('codex-dash resume ' + session_id)}"
+    cwd = str(session.get("cwd") or Path.home())
+    return f"codex resume --cd {shell_quote(cwd)} {shell_quote(session_id)}"
+
+
+def open_terminal_command(command: str, title: str = "codex-dash") -> int:
+    system = platform.system().lower()
+    if system == "windows":
+        wt = shutil.which("wt.exe") if "shutil" in globals() else None
+        if wt:
+            return subprocess.Popen([wt, "new-tab", "--title", title, "powershell", "-NoExit", "-Command", command]).returncode or 0
+        subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", f"Start-Process powershell -ArgumentList @('-NoExit','-Command',{json.dumps(command)})"])
+        return 0
+    if system == "darwin":
+        script = f'tell application "Terminal" to do script {json.dumps(command)}'
+        subprocess.Popen(["osascript", "-e", script])
+        return 0
+    terminal = shutil.which("x-terminal-emulator") if "shutil" in globals() else None
+    terminal = terminal or (shutil.which("gnome-terminal") if "shutil" in globals() else None)
+    terminal = terminal or (shutil.which("konsole") if "shutil" in globals() else None)
+    if terminal:
+        subprocess.Popen([terminal, "-e", "sh", "-lc", command])
+        return 0
+    return run_shell_command(command)
+
+
+def command_open_session(args: argparse.Namespace) -> None:
+    target = find_session_by_prefix(args.session_id)
+    attach_command = str(target.get("attach_command") or "").strip()
+    command = attach_command or resume_command_for_session(target)
+    print(f"Opening terminal: {command}")
+    raise SystemExit(open_terminal_command(command, short_title(str(target.get("generated_title") or target.get("title") or "codex"), 48)))
 
 
 def command_attach(args: argparse.Namespace) -> None:
@@ -4292,6 +4404,10 @@ def build_parser() -> argparse.ArgumentParser:
     resume = sub.add_parser("resume", help="Resume a session by full id or unique prefix")
     resume.add_argument("session_id")
     resume.set_defaults(func=command_resume)
+
+    open_cmd = sub.add_parser("open", help="Open or attach a session in a terminal")
+    open_cmd.add_argument("session_id")
+    open_cmd.set_defaults(func=command_open_session)
 
     attach = sub.add_parser("attach", help="Run the recorded attach command for a tmux/SSH session")
     attach.add_argument("session_id")
