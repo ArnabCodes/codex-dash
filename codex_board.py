@@ -35,6 +35,7 @@ PROJECTS_DIR = BOARD_HOME / "projects"
 LAUNCHES_PATH = BOARD_HOME / "launches.json"
 PEERS_PATH = BOARD_HOME / "peers.json"
 DELETED_SESSIONS_PATH = BOARD_HOME / "deleted_sessions.json"
+USAGE_CACHE_PATH = BOARD_HOME / "usage_cache.json"
 RECENT_SECONDS = 7 * 24 * 60 * 60
 HEARTBEAT_SECONDS = 120
 TEMPERATURE_REFRESH_SECONDS = 30
@@ -1105,6 +1106,52 @@ def refresh_export_quiet(limit: int = 500) -> tuple[bool, str]:
         return True, ""
     except Exception as exc:
         return False, str(exc)
+
+
+def load_usage_cache(width: int) -> dict[str, Any]:
+    try:
+        data = json.loads(USAGE_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    entries = data.get("entries") if isinstance(data, dict) else {}
+    if not isinstance(entries, dict):
+        return {}
+    exact = entries.get(str(width))
+    if isinstance(exact, dict):
+        return exact
+    candidates = [entry for entry in entries.values() if isinstance(entry, dict) and isinstance(entry.get("lines"), list)]
+    if not candidates:
+        return {}
+    return max(candidates, key=lambda entry: int(entry.get("updated_at_epoch") or 0))
+
+
+def save_usage_cache(width: int, dashboard: dict[str, Any]) -> None:
+    lines = list(dashboard.get("lines") or [])
+    if not lines:
+        return
+    try:
+        data = json.loads(USAGE_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    entries = data.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+        data["entries"] = entries
+    now_epoch = int(time.time())
+    entries[str(width)] = {
+        "width": width,
+        "updated_at": now_utc(),
+        "updated_at_epoch": now_epoch,
+        "lines": lines,
+        "errors": list(dashboard.get("errors") or []),
+    }
+    try:
+        USAGE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        USAGE_CACHE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def codex_state_signature() -> tuple[int, int, int, int, int]:
@@ -2292,6 +2339,9 @@ class AnsiDashboardApp:
         self.usage_loading = False
         self.usage_thread: threading.Thread | None = None
         self.usage_width = 0
+        self.usage_cached_at = ""
+        self.usage_animation_started = 0.0
+        self.usage_animation_duration = 0.9
         self.search_mode = False
         self.search_buffer = ""
         self.command_mode = False
@@ -3173,14 +3223,53 @@ class AnsiDashboardApp:
         rendered, self.help_top = self.render_centered_overlay("? Key Bindings", self.help_content_rows(body_width), self.help_top, "help")
         return rendered
 
+    def load_cached_usage_rows(self, content_width: int) -> bool:
+        cached = load_usage_cache(content_width)
+        lines = list(cached.get("lines") or [])
+        if not lines:
+            return False
+        self.usage_rows = lines
+        self.usage_width = int(cached.get("width") or content_width)
+        self.usage_cached_at = str(cached.get("updated_at") or "")
+        return True
+
+    def animated_usage_line(self, raw: str) -> str:
+        if not self.usage_animation_started:
+            return raw
+        progress = min(1.0, max(0.0, (time.time() - self.usage_animation_started) / self.usage_animation_duration))
+        if progress >= 1.0:
+            return raw
+
+        def animate_pair(filled: str, empty: str, text: str) -> str:
+            pattern = re.compile(f"([{re.escape(filled + empty)}]{{4,16}})")
+
+            def replace(match: re.Match[str]) -> str:
+                segment = match.group(1)
+                width = len(segment)
+                full = segment.count(filled)
+                shown = min(width, int(round(full * progress)))
+                return filled * shown + empty * (width - shown)
+
+            return pattern.sub(replace, text)
+
+        raw = animate_pair("━", "─", raw)
+        raw = animate_pair("█", "░", raw)
+        raw = animate_pair("â”", "â”€", raw)
+        raw = animate_pair("â–ˆ", "â–‘", raw)
+        return raw
+
     def usage_content_rows(self, body_width: int) -> list[str]:
         inner_width = max(1, body_width - 4)
-        if self.usage_loading:
+        if self.usage_rows:
+            raw_rows = self.usage_rows
+            if self.usage_loading:
+                cached_epoch = parse_timestamp_epoch(self.usage_cached_at)
+                stamp = f"cached {format_ts(cached_epoch)}" if cached_epoch else "cached"
+                raw_rows = raw_rows[:4] + [f"Refreshing latest stats in background; showing {stamp}."] + raw_rows[4:]
+        elif self.usage_loading:
             raw_rows = ["Loading local Codex usage stats...", "", "Reading .codex session cache, dashboard exports, and local log databases."]
         elif self.usage_error:
             raw_rows = ["Local usage stats failed", "", self.usage_error]
-        elif self.usage_rows:
-            raw_rows = self.usage_rows
         else:
             raw_rows = ["Press u to load local Codex usage stats."]
         rows = []
@@ -3215,6 +3304,7 @@ class AnsiDashboardApp:
             return "38;2;220;224;232"
 
         for index, raw in enumerate(raw_rows):
+            raw = self.animated_usage_line(raw)
             if not raw:
                 rows.append(self.pane_row("", body_width, "38;2;126;203;255"))
                 continue
@@ -3230,10 +3320,13 @@ class AnsiDashboardApp:
     def render_usage_overlay(self) -> str:
         body_width, _ = self.modal_dimensions(preferred_width=82)
         content_width = max(32, body_width - 4)
-        if self.usage_rows and not self.usage_loading and not self.usage_error and self.usage_width != content_width:
-            dashboard = build_usage_dashboard(top=8, show_errors=False, width=content_width)
-            self.usage_rows = list(dashboard.get("lines") or [])
-            self.usage_width = content_width
+        if not self.usage_rows and not self.usage_loading:
+            self.load_cached_usage_rows(content_width)
+        if self.usage_rows and self.usage_width != content_width and not self.usage_loading:
+            if self.load_cached_usage_rows(content_width):
+                self.usage_animation_started = time.time()
+            if self.usage_width != content_width:
+                self.start_usage_refresh()
         rows = self.usage_content_rows(body_width)
         rendered, self.usage_top = self.render_centered_overlay("Local Codex Usage", rows, self.usage_top, "u refresh")
         return rendered
@@ -3243,20 +3336,25 @@ class AnsiDashboardApp:
             return
         self.usage_loading = True
         self.usage_error = ""
-        self.usage_rows = []
-        self.usage_top = 0
         body_width, _ = self.modal_dimensions(preferred_width=82)
         content_width = max(32, body_width - 4)
         self.usage_width = content_width
+        if not self.usage_rows:
+            self.load_cached_usage_rows(content_width)
+            self.usage_top = 0
+        self.usage_animation_started = time.time()
 
         def worker() -> None:
             try:
                 dashboard = build_usage_dashboard(top=8, show_errors=False, width=content_width)
+                save_usage_cache(content_width, dashboard)
                 lines = list(dashboard.get("lines") or [])
                 errors = list(dashboard.get("errors") or [])
                 if errors:
                     lines.extend(["", f"Skipped {len(errors)} local source(s). Run codex-dash usage --show-errors for details."])
                 self.usage_rows = lines or ["No usage stats returned."]
+                self.usage_cached_at = now_utc()
+                self.usage_animation_started = time.time()
             except Exception as exc:
                 self.usage_error = str(exc)
             finally:
@@ -3268,7 +3366,12 @@ class AnsiDashboardApp:
     def open_usage_overlay(self, refresh: bool = False) -> None:
         self.show_usage = True
         self.show_help = False
-        if refresh or (not self.usage_rows and not self.usage_error):
+        body_width, _ = self.modal_dimensions(preferred_width=82)
+        content_width = max(32, body_width - 4)
+        if not self.usage_rows:
+            if self.load_cached_usage_rows(content_width):
+                self.usage_animation_started = time.time()
+        if refresh or not self.usage_loading:
             self.start_usage_refresh()
 
     def modal_content_height(self) -> int:
@@ -4347,7 +4450,7 @@ def usage_bar(value: float, maximum: float, width: int = 8) -> str:
         filled = 0
     else:
         filled = max(0, min(width, int(round((value / maximum) * width))))
-    return "█" * filled + "░" * (width - filled)
+    return "━" * filled + "─" * (width - filled)
 
 
 def clip_usage_cell(text: str, width: int) -> str:
@@ -4616,6 +4719,7 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
 def command_usage(args: argparse.Namespace) -> None:
     terminal_width = max(44, min(140, os.get_terminal_size().columns - 6)) if sys.stdout.isatty() else 74
     dashboard = build_usage_dashboard(top=args.top, show_errors=args.show_errors, width=terminal_width)
+    save_usage_cache(terminal_width, dashboard)
     if args.json:
         print(json.dumps({"periods": dashboard["periods"], "token_mix": dashboard["capabilities"], "errors": dashboard["errors"], "sessions": dashboard["sessions"]}, indent=2))
     else:
