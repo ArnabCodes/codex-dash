@@ -3318,7 +3318,7 @@ class AnsiDashboardApp:
         return rows
 
     def render_usage_overlay(self) -> str:
-        body_width, _ = self.modal_dimensions(preferred_width=82)
+        body_width, _ = self.modal_dimensions(preferred_width=96)
         content_width = max(32, body_width - 4)
         if not self.usage_rows and not self.usage_loading:
             self.load_cached_usage_rows(content_width)
@@ -3335,7 +3335,7 @@ class AnsiDashboardApp:
             return
         self.usage_loading = True
         self.usage_error = ""
-        body_width, _ = self.modal_dimensions(preferred_width=82)
+        body_width, _ = self.modal_dimensions(preferred_width=96)
         content_width = max(32, body_width - 4)
         self.usage_width = content_width
         if not self.usage_rows:
@@ -3363,7 +3363,7 @@ class AnsiDashboardApp:
     def open_usage_overlay(self, refresh: bool = False) -> None:
         self.show_usage = True
         self.show_help = False
-        body_width, _ = self.modal_dimensions(preferred_width=82)
+        body_width, _ = self.modal_dimensions(preferred_width=96)
         content_width = max(32, body_width - 4)
         if not self.usage_rows:
             self.load_cached_usage_rows(content_width)
@@ -3473,7 +3473,7 @@ class AnsiDashboardApp:
         self.help_top = min(max(self.help_top + delta, 0), max_top)
 
     def scroll_usage(self, delta: int) -> None:
-        body_width, _ = self.modal_dimensions(preferred_width=82)
+        body_width, _ = self.modal_dimensions(preferred_width=96)
         max_top = max(0, len(self.usage_content_rows(body_width)) - self.modal_content_height())
         self.usage_top = min(max(self.usage_top + delta, 0), max_top)
 
