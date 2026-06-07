@@ -1813,7 +1813,10 @@ KEY_BINDINGS: list[tuple[str, str, str]] = [
     ("Projects", "p", "Assign selected session to current/project id"),
     ("Actions", "r", "Refresh local session export"),
     ("Actions", "u", "Show local Codex usage stats"),
-    ("Actions", "N", "Open a new Codex session in a terminal"),
+    ("Actions", ":new", "Open a new Codex session in a terminal"),
+    ("Actions", ":usage", "Show local Codex usage stats"),
+    ("Actions", ":refresh", "Refresh local session export"),
+    ("Actions", ":quit", "Quit dashboard"),
     ("Actions", "Enter", "Open selected session in a terminal"),
     ("Actions", "d", "Hide selected broken session from dashboard"),
     ("Actions", "o", "Open/attach selected tmux or SSH session when metadata exists"),
@@ -1942,6 +1945,12 @@ class DashboardApp:
         ok, message = open_session_terminal(session)
         self.message = message if ok else f"Open failed: {message}"
 
+    def open_new_session(self) -> None:
+        session = self.current()
+        cwd = str(session.get("cwd") or "") if session else ""
+        ok, message = open_new_session_terminal(cwd or None)
+        self.message = message if ok else f"Open failed: {message}"
+
     def prompt_search(self) -> None:
         import curses
 
@@ -1960,6 +1969,40 @@ class DashboardApp:
             self.message = f"Filter: {self.query}" if self.query else "Filter cleared"
         finally:
             curses.noecho()
+
+    def prompt_command(self) -> bool:
+        import curses
+
+        curses.echo()
+        height, width = self.stdscr.getmaxyx()
+        self.stdscr.move(height - 1, 0)
+        self.stdscr.clrtoeol()
+        self.stdscr.addnstr(height - 1, 0, ":", max(1, width - 1), curses.color_pair(3))
+        try:
+            raw = self.stdscr.getstr(height - 1, 1, max(1, width - 2))
+            command = raw.decode(errors="ignore").strip().lower()
+        finally:
+            curses.noecho()
+        if command.startswith(":"):
+            command = command[1:].strip()
+        if command in ("new", "n"):
+            self.open_new_session()
+            return False
+        if command in ("refresh", "reload", "r"):
+            try:
+                export_state(argparse.Namespace(limit=self.args.limit))
+                self.reload(quiet=True)
+                self.message = f"Refreshed {len(self.sessions)} sessions"
+            except Exception as exc:
+                self.message = f"Refresh failed: {exc}"
+            return False
+        if command in ("quit", "q", "exit"):
+            return True
+        if not command:
+            self.message = "Command cancelled"
+        else:
+            self.message = f"Unknown command: {command}"
+        return False
 
     def cycle_search(self, delta: int) -> None:
         if not self.last_search:
@@ -2033,7 +2076,7 @@ class DashboardApp:
     def draw_help(self, y: int, width: int) -> None:
         import curses
 
-        help_text = " j/k move  gg/G top/bottom  ^f/^b page  ^d/^u half  / filter  n/N next  r refresh  Enter resume  q quit "
+        help_text = " j/k move  gg/G top/bottom  ^f/^b page  ^d/^u half  / filter  n/N next  :new session  r refresh  Enter resume  q quit "
         if self.message:
             help_text = f" {self.message} |" + help_text
         self.safe_add(y, 0, help_text.ljust(width), width, curses.color_pair(1))
@@ -2207,6 +2250,9 @@ class DashboardApp:
                 self.move(-1)
             elif key == ord("/"):
                 self.prompt_search()
+            elif key == ord(":"):
+                if self.prompt_command():
+                    return
             elif key == ord("n"):
                 self.cycle_search(1)
             elif key == ord("N"):
@@ -2248,6 +2294,9 @@ class AnsiDashboardApp:
         self.usage_width = 0
         self.search_mode = False
         self.search_buffer = ""
+        self.command_mode = False
+        self.command_buffer = ""
+        self.should_quit = False
         self.input_mode: str | None = None
         self.input_buffer = ""
         self.input_data: dict[str, str] = {}
@@ -2814,6 +2863,10 @@ class AnsiDashboardApp:
             prompt = self.block(" / ", "24;31;44", "92;214;144")
             value = self.color(self.search_buffer or "type to filter, Enter accept, Esc cancel", "38;2;238;241;245;48;2;24;31;44")
             return self.fit_ansi(prompt + value, width)
+        if self.command_mode:
+            prompt = self.block(" : ", "24;31;44", "174;141;255")
+            value = self.color(self.command_buffer or "new | usage | refresh | quit", "38;2;238;241;245;48;2;24;31;44")
+            return self.fit_ansi(prompt + value, width)
         selected = f"{self.cursor + 1}/{len(self.visible)}" if self.visible else "0/0"
         project = "all" if self.project_filter == "all" else self.names.get(self.project_filter, self.project_filter)
         message = self.message or "ready"
@@ -3197,6 +3250,43 @@ class AnsiDashboardApp:
         self.search_mode = False
         self.search_buffer = ""
         self.message = "Search cancelled"
+
+    def prompt_command(self) -> None:
+        self.command_mode = True
+        self.command_buffer = ""
+        self.message = "Command mode"
+
+    def cancel_command(self) -> None:
+        self.command_mode = False
+        self.command_buffer = ""
+        self.message = "Command cancelled"
+
+    def accept_command(self) -> None:
+        command = self.command_buffer.strip().lower()
+        self.command_mode = False
+        self.command_buffer = ""
+        if command.startswith(":"):
+            command = command[1:].strip()
+        if command in ("new", "n"):
+            self.open_new_session()
+            return
+        if command in ("usage", "stats", "u"):
+            self.open_usage_overlay()
+            return
+        if command in ("refresh", "reload", "r"):
+            self.start_background_refresh(force=True)
+            return
+        if command in ("quit", "q", "exit"):
+            self.should_quit = True
+            return
+        if command in ("help", "?"):
+            self.show_help = True
+            self.help_top = 0
+            return
+        if not command:
+            self.message = "Command cancelled"
+            return
+        self.message = f"Unknown command: {command}"
 
     def go_back(self) -> None:
         if self.show_help:
@@ -3633,7 +3723,7 @@ class AnsiDashboardApp:
                 key = self.read_key(timeout=0.2)
                 if key == "tick":
                     self.spinner_index = (self.spinner_index + 1) % len(SPINNER_FRAMES)
-                    if not self.search_mode and not self.input_mode and not self.show_help and not self.show_usage:
+                    if not self.search_mode and not self.command_mode and not self.input_mode and not self.show_help and not self.show_usage:
                         self.reload_if_board_changed()
                         self.auto_refresh()
                     continue
@@ -3656,6 +3746,18 @@ class AnsiDashboardApp:
                     elif len(key) == 1 and key >= " ":
                         self.search_buffer += key
                     continue
+                if self.command_mode:
+                    if key in ("\x1b",):
+                        self.cancel_command()
+                    elif key in ("\r", "\n"):
+                        self.accept_command()
+                    elif key in ("\b", "\x7f"):
+                        self.command_buffer = self.command_buffer[:-1]
+                    elif len(key) == 1 and key >= " ":
+                        self.command_buffer += key
+                    continue
+                if self.should_quit:
+                    return
                 if self.show_help:
                     if key == "q":
                         return
@@ -3711,6 +3813,9 @@ class AnsiDashboardApp:
                     self.show_help = True
                     self.help_top = 0
                     continue
+                if key == ":":
+                    self.prompt_command()
+                    continue
                 if key == "u":
                     self.open_usage_overlay()
                     continue
@@ -3764,8 +3869,6 @@ class AnsiDashboardApp:
                     self.cycle_status(1)
                 elif key == "S":
                     self.cycle_sort()
-                elif key == "N":
-                    self.open_new_session()
                 elif key == "c":
                     self.prompt_create_project()
                 elif key == "p":
