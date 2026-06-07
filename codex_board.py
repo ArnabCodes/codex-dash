@@ -3048,12 +3048,18 @@ class AnsiDashboardApp:
                 rows.append(self.pane_row(" " * (key_width + 1) + extra, body_width, "38;2;126;203;255"))
         return rows
 
-    def modal_dimensions(self) -> tuple[int, int]:
+    def modal_dimensions(self, content_rows: list[str] | None = None, preferred_width: int = 0) -> tuple[int, int]:
         height, width = self.term_size()
-        width = max(50, width)
-        height = max(12, height)
-        modal_width = min(width - 4, max(42, int(width * 0.82)))
-        modal_height = min(height - 4, max(10, int(height * 0.78)))
+        max_width = max(24, min(width - 4, 96))
+        min_width = min(max_width, 42)
+        content_width = preferred_width
+        if content_rows:
+            content_width = max(content_width, max((self.visible_len(row) for row in content_rows), default=0) + 4)
+        modal_width = min(max_width, max(min_width, content_width))
+        max_height = max(6, min(height - 4, 28))
+        min_height = min(max_height, 8)
+        desired_height = (len(content_rows) if content_rows is not None else max_height) + 3
+        modal_height = min(max_height, max(min_height, desired_height))
         return modal_width, modal_height
 
     def render_centered_overlay(self, title: str, content_rows: list[str], scroll_top: int, hint_left: str, border: str = "38;2;126;203;255") -> tuple[str, int]:
@@ -3064,7 +3070,7 @@ class AnsiDashboardApp:
         base_rows = base.removesuffix("\x1b[J").splitlines()
         if base_rows:
             base_rows[0] = base_rows[0].replace("\x1b[?25l\x1b[H", "", 1)
-        body_width, modal_height = self.modal_dimensions()
+        body_width, modal_height = self.modal_dimensions(content_rows, preferred_width=self.visible_len(title) + 10)
         content_height = max(1, modal_height - 3)
         max_top = max(0, len(content_rows) - content_height)
         scroll_top = min(max(0, scroll_top), max_top)
@@ -3073,7 +3079,6 @@ class AnsiDashboardApp:
         rows.extend(content_rows[scroll_top : scroll_top + content_height])
         rows.extend(self.pane_row("", body_width, "38;2;126;203;255") for _ in range(max(0, content_height - (len(rows) - 1))))
         position = f"{scroll_top + 1}-{min(len(content_rows), scroll_top + content_height)}/{len(content_rows)}" if content_rows else "0/0"
-        hint = self.color(f" {hint_left}  j/k scroll  ↑/↓ scroll  Esc back  q quit  {position} ", "38;2;24;31;44;48;2;126;203;255;1")
         hint = self.color(f" {hint_left}  j/k scroll  Up/Down scroll  Esc back  q quit  {position} ", "38;2;24;31;44;48;2;126;203;255;1")
         rows.append(self.pane_row(hint, body_width, border))
         rows.append(self.color(self.bottom_box(body_width), border + ";1"))
@@ -3092,7 +3097,7 @@ class AnsiDashboardApp:
         return "\n".join(composed[:height]) + "\x1b[J", scroll_top
 
     def render_help(self) -> str:
-        body_width, _ = self.modal_dimensions()
+        body_width, _ = self.modal_dimensions(preferred_width=68)
         rendered, self.help_top = self.render_centered_overlay("? Key Bindings", self.help_content_rows(body_width), self.help_top, "help")
         return rendered
 
@@ -3125,13 +3130,14 @@ class AnsiDashboardApp:
         return rows
 
     def render_usage_overlay(self) -> str:
-        body_width, _ = self.modal_dimensions()
+        body_width, _ = self.modal_dimensions(preferred_width=82)
         content_width = max(32, body_width - 4)
         if self.usage_rows and not self.usage_loading and not self.usage_error and self.usage_width != content_width:
             dashboard = build_usage_dashboard(top=8, show_errors=False, width=content_width)
             self.usage_rows = list(dashboard.get("lines") or [])
             self.usage_width = content_width
-        rendered, self.usage_top = self.render_centered_overlay("Local Codex Usage", self.usage_content_rows(body_width), self.usage_top, "u refresh")
+        rows = self.usage_content_rows(body_width)
+        rendered, self.usage_top = self.render_centered_overlay("Local Codex Usage", rows, self.usage_top, "u refresh")
         return rendered
 
     def start_usage_refresh(self) -> None:
@@ -3141,7 +3147,7 @@ class AnsiDashboardApp:
         self.usage_error = ""
         self.usage_rows = []
         self.usage_top = 0
-        body_width, _ = self.modal_dimensions()
+        body_width, _ = self.modal_dimensions(preferred_width=82)
         content_width = max(32, body_width - 4)
         self.usage_width = content_width
 
@@ -3228,12 +3234,12 @@ class AnsiDashboardApp:
         self.message = "Press q to quit"
 
     def scroll_help(self, delta: int) -> None:
-        body_width, _ = self.modal_dimensions()
+        body_width, _ = self.modal_dimensions(preferred_width=68)
         max_top = max(0, len(self.help_content_rows(body_width)) - self.modal_content_height())
         self.help_top = min(max(self.help_top + delta, 0), max_top)
 
     def scroll_usage(self, delta: int) -> None:
-        body_width, _ = self.modal_dimensions()
+        body_width, _ = self.modal_dimensions(preferred_width=82)
         max_top = max(0, len(self.usage_content_rows(body_width)) - self.modal_content_height())
         self.usage_top = min(max(self.usage_top + delta, 0), max_top)
 
