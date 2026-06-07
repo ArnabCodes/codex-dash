@@ -3236,8 +3236,11 @@ class AnsiDashboardApp:
             return self.color(raw, color)
         muted = "38;2;88;96;108"
         bar_pairs = {
+            "▓": "░",
             "█": "░",
+            "â–“": "â–‘",
             "â–ˆ": "â–‘",
+            "Ã¢â€“â€œ": "Ã¢â€“â€˜",
             "Ã¢â€“Ë†": "Ã¢â€“â€˜",
         }
         singles = {glyph for pair in bar_pairs.items() for glyph in pair}
@@ -3249,7 +3252,7 @@ class AnsiDashboardApp:
                 parts.append(self.color(raw[index : match.start()], color))
             glyph = match.group(0)
             is_filled = glyph in bar_pairs
-            parts.append(self.color("█", accent if is_filled else muted))
+            parts.append(self.color("▓", accent if is_filled else muted))
             index = match.end()
         if index < len(raw):
             parts.append(self.color(raw[index:], color))
@@ -3369,7 +3372,7 @@ class AnsiDashboardApp:
 
     def modal_content_height(self) -> int:
         _, modal_height = self.modal_dimensions()
-        return max(1, modal_height - 3)
+        return max(1, modal_height - 5)
 
     def prompt_search(self) -> None:
         self.search_mode = True
@@ -4446,7 +4449,7 @@ def usage_bar(value: float, maximum: float, width: int = USAGE_BAR_WIDTH) -> str
         filled = 0
     else:
         filled = max(0, min(width, int(round((value / maximum) * width))))
-    return "█" * filled + "░" * (width - filled)
+    return "▓" * filled + "░" * (width - filled)
 
 
 def clip_usage_cell(text: str, width: int) -> str:
@@ -4463,19 +4466,40 @@ def usage_columns(left: str, right: str = "", width: int = 74) -> str:
     return clip_usage_cell(left, column_width) + gap + clip_usage_cell(right, column_width)
 
 
-def render_usage_columns(title: str, left_rows: list[str], right_rows: list[str], width: int = 74) -> list[str]:
+def render_usage_card(title: str, rows_in: list[str], width: int = 74) -> list[str]:
     width = max(24, width)
     label = f" {title} "
     top = "╭" + label + "─" * max(0, width - len(label) - 2) + "╮"
     bottom = "╰" + "─" * max(0, width - 2) + "╯"
     rows = [top]
+    for row in rows_in:
+        rows.append("│ " + clip_usage_cell(row, max(1, width - 4)) + " │")
+    rows.append(bottom)
+    return rows
+
+
+def render_usage_card_pair(left_title: str, left_rows: list[str], right_title: str, right_rows: list[str], width: int = 74) -> list[str]:
+    gap = "  "
+    card_width = max(24, (width - len(gap)) // 2)
+    left_card = render_usage_card(left_title, left_rows, card_width)
+    right_card = render_usage_card(right_title, right_rows, card_width)
+    height = max(len(left_card), len(right_card))
+    blank = " " * card_width
+    return [
+        (left_card[index] if index < len(left_card) else blank) + gap + (right_card[index] if index < len(right_card) else blank)
+        for index in range(height)
+    ]
+
+
+def render_usage_columns(title: str, left_rows: list[str], right_rows: list[str], width: int = 74) -> list[str]:
+    width = max(24, width)
+    rows: list[str] = []
     max_rows = max(len(left_rows), len(right_rows))
     for index in range(max_rows):
         left = left_rows[index] if index < len(left_rows) else ""
         right = right_rows[index] if index < len(right_rows) else ""
-        rows.append("│ " + clip_usage_cell(usage_columns(left, right, max(1, width - 4)), max(1, width - 4)) + " │")
-    rows.append(bottom)
-    return rows
+        rows.append(usage_columns(left, right, width))
+    return render_usage_card(title, rows, width)
 
 
 def usage_value_row(label: str, value: str, detail: str = "") -> str:
@@ -4485,11 +4509,20 @@ def usage_value_row(label: str, value: str, detail: str = "") -> str:
     return text
 
 
-def usage_signal_row(label: str, display_value: str, value: float, maximum: float, detail: str = "") -> str:
-    text = f"{label:<14.14} {display_value:>8} {usage_bar(value, maximum)}"
-    if detail:
-        text += f" {detail}"
-    return text
+def usage_signal_row(label: str, display_value: str, value: float, maximum: float, detail: str = "", width: int = 74) -> str:
+    bar = usage_bar(value, maximum)
+    suffix = f" {detail}" if detail else ""
+    left = f"{label:<16.16} {display_value:>8}{suffix}"
+    bar_start = max(1, width - len(bar))
+    if len(left) >= bar_start:
+        return clip_usage_cell(left, max(1, bar_start - 1)) + " " + bar
+    return left + " " * (bar_start - len(left)) + bar
+
+
+def render_usage_signal_card(title: str, rows_in: list[tuple[str, str, float, float, str]], width: int = 74) -> list[str]:
+    inner_width = max(20, width - 4)
+    rows = [usage_signal_row(label, display, value, maximum, detail, inner_width) for label, display, value, maximum, detail in rows_in]
+    return render_usage_card(title, rows, width)
 
 
 def dedupe_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4625,17 +4658,16 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
 
     max_context_session = max(sessions, key=lambda row: float(row.get("context_used_percent") or 0), default={})
     max_rate_session = max(sessions, key=lambda row: float(row.get("rate_used_percent") or 0), default={})
-    useful_left = [
-        usage_signal_row("󰄬 Cache hit", f"{cache_ratio:.1f}%", cache_ratio, 100),
-        usage_signal_row("󰈸 Output/in", f"{output_ratio:.2f}%", output_ratio, 10),
-        usage_signal_row("󰅟 Reason/out", f"{reasoning_ratio:.1f}%", reasoning_ratio, 100),
-    ]
-    useful_right = [
-        usage_signal_row("󰯲 Avg context", f"{all_totals['avg_context_used_percent']:.1f}%", all_totals["avg_context_used_percent"], 100),
-        usage_signal_row("󱎫 Peak ctx", f"{float(max_context_session.get('context_used_percent') or 0):.1f}%", float(max_context_session.get("context_used_percent") or 0), 100, detail=str(max_context_session.get("project_id") or "n/a")[:8]),
-        usage_signal_row("󰍛 Rate press", f"{float(max_rate_session.get('rate_used_percent') or 0):.1f}%", float(max_rate_session.get("rate_used_percent") or 0), 100, detail=str(max_rate_session.get("rate_plan_type") or "n/a")[:8]),
+    signal_rows = [
+        ("󰄬 Cache hit", f"{cache_ratio:.1f}%", cache_ratio, 100, ""),
+        ("󰈸 Output/in", f"{output_ratio:.2f}%", output_ratio, 10, ""),
+        ("󰅟 Reason/out", f"{reasoning_ratio:.1f}%", reasoning_ratio, 100, ""),
+        ("󰯲 Avg context", f"{all_totals['avg_context_used_percent']:.1f}%", all_totals["avg_context_used_percent"], 100, ""),
+        ("󱎫 Peak ctx", f"{float(max_context_session.get('context_used_percent') or 0):.1f}%", float(max_context_session.get("context_used_percent") or 0), 100, str(max_context_session.get("project_id") or "n/a")[:8]),
+        ("󰍛 Rate press", f"{float(max_rate_session.get('rate_used_percent') or 0):.1f}%", float(max_rate_session.get("rate_used_percent") or 0), 100, str(max_rate_session.get("rate_plan_type") or "n/a")[:8]),
     ]
 
+    period_rows = [row for card in period_cards for row in card]
     period_left = [row for card in period_cards[0::2] for row in card]
     period_right = [row for card in period_cards[1::2] for row in card]
     token_left = [
@@ -4653,22 +4685,28 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
     machine_rows = [usage_value_row(f" {label:<10}"[:14], format_metric(value)) for label, value in top_machines[:top]]
     recent_rows = [f"󰈙 {label:<22} {value}" for label, value in recent_sessions[:top]]
 
+    if width >= 88:
+        top_cards = render_usage_card_pair("󰓅 Session Tokens", period_rows, "󰋊 Token Mix", token_left + token_right, width)
+    else:
+        top_cards = render_usage_columns("󰓅 Session Tokens", period_left, period_right, width) + [""] + render_usage_columns("󰋊 Token Mix", token_left, token_right, width)
+
     lines = [
         "Local Codex Usage",
         f"󰋊 {CODEX_HOME}",
         f"󰉋 {BOARD_HOME}",
         f"Updated: {now.strftime('%Y-%m-%d %H:%M %Z')}",
         "",
-        *render_usage_columns("󰓅 Session Tokens", period_left, period_right, width),
+        *top_cards,
         "",
-        *render_usage_columns("󰋊 Token Mix", token_left, token_right, width),
-        "",
-        *render_usage_columns("󰌵 Useful Signals", useful_left, useful_right, width),
+        *render_usage_signal_card("󰌵 Useful Signals", signal_rows, width),
     ]
-    if project_rows or model_rows:
-        lines.extend(["", *render_usage_columns("󰏗 Leaders This Month", project_rows, model_rows, width)])
-    if machine_rows or recent_rows:
-        lines.extend(["", *render_usage_columns(" Machines / Recent", machine_rows, recent_rows, width)])
+    if width >= 88 and (project_rows or model_rows) and (machine_rows or recent_rows):
+        lines.extend(["", *render_usage_card_pair("󰏗 Leaders This Month", project_rows + model_rows, " Machines / Recent", machine_rows + recent_rows, width)])
+    else:
+        if project_rows or model_rows:
+            lines.extend(["", *render_usage_columns("󰏗 Leaders This Month", project_rows, model_rows, width)])
+        if machine_rows or recent_rows:
+            lines.extend(["", *render_usage_columns(" Machines / Recent", machine_rows, recent_rows, width)])
 
     thread_stats = read_local_thread_stats()
     state_rows: list[str] = []
