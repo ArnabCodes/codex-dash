@@ -115,7 +115,7 @@ $gpuHotspot = ($rows | Where-Object {{ $_.HardwareType -like 'Gpu*' }} | Where-O
     ]
 
 
-def lhm_config_cpu_temperature(max_age_seconds: int = 900) -> float | None:
+def lhm_config_cpu_temperature(max_age_seconds: int = 14_400) -> float | None:
     config_path = Path(os.environ.get("LIBRE_HARDWARE_MONITOR_CONFIG", LHM_WINGET_PACKAGE / "LibreHardwareMonitor.config"))
     if not config_path.exists():
         return None
@@ -1907,7 +1907,8 @@ class DashboardApp:
         if not session:
             self.message = "No session selected"
             return
-        self.open_id = session["id"]
+        ok, message = open_session_terminal(session)
+        self.message = message if ok else f"Open failed: {message}"
 
     def prompt_search(self) -> None:
         import curses
@@ -2193,8 +2194,6 @@ class DashboardApp:
                     self.message = f"Refresh failed: {exc}"
             elif key in (ord("\n"), ord("\r"), curses.KEY_ENTER):
                 self.resume_current()
-                if self.open_id:
-                    return
 
 
 class AnsiDashboardApp:
@@ -3729,8 +3728,8 @@ class AnsiDashboardApp:
                 elif key in ("\r", "\n"):
                     session = self.current()
                     if session:
-                        self.open_id = session["id"]
-                        return
+                        ok, message = open_session_terminal(session)
+                        self.message = message if ok else f"Open failed: {message}"
         finally:
             print("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h", end="", flush=True)
             self.restore_windows_console_input(original_input_mode)
@@ -3739,9 +3738,6 @@ class AnsiDashboardApp:
 def run_ansi_dashboard(args: argparse.Namespace) -> None:
     app = AnsiDashboardApp(args)
     app.run()
-    if app.open_id:
-        args.session_id = app.open_id
-        command_open_session(args)
     if app.attach_id:
         args.session_id = app.attach_id
         command_attach(args)
@@ -3782,10 +3778,7 @@ def command_dashboard(args: argparse.Namespace) -> None:
         args.per_group = args.per_group or 20
         command_list(args)
         return
-    if app and app.open_id:
-        args.session_id = app.open_id
-        command_open_session(args)
-    elif app and app.resume_id:
+    if app and app.resume_id:
         args.session_id = app.resume_id
         command_resume(args)
 
@@ -3852,15 +3845,28 @@ def open_terminal_command(command: str, title: str = "codex-dash") -> int:
     if terminal:
         subprocess.Popen([terminal, "-e", "sh", "-lc", command])
         return 0
-    return run_shell_command(command)
+    return 2
+
+
+def open_session_terminal(session: dict[str, Any]) -> tuple[bool, str]:
+    attach_command = str(session.get("attach_command") or "").strip()
+    command = attach_command or resume_command_for_session(session)
+    title = short_title(str(session.get("generated_title") or session.get("title") or "codex"), 48)
+    try:
+        code = open_terminal_command(command, title)
+    except Exception as exc:
+        return False, str(exc)
+    if code not in (0, None):
+        return False, f"terminal command exited with {code}"
+    label = "attached" if attach_command else "opened"
+    return True, f"{label}: {short_title(title, 60)}"
 
 
 def command_open_session(args: argparse.Namespace) -> None:
     target = find_session_by_prefix(args.session_id)
-    attach_command = str(target.get("attach_command") or "").strip()
-    command = attach_command or resume_command_for_session(target)
-    print(f"Opening terminal: {command}")
-    raise SystemExit(open_terminal_command(command, short_title(str(target.get("generated_title") or target.get("title") or "codex"), 48)))
+    ok, message = open_session_terminal(target)
+    print(message)
+    raise SystemExit(0 if ok else 1)
 
 
 def command_attach(args: argparse.Namespace) -> None:
