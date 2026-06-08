@@ -38,8 +38,13 @@ DELETED_SESSIONS_PATH = BOARD_HOME / "deleted_sessions.json"
 USAGE_CACHE_PATH = BOARD_HOME / "usage_cache.json"
 RECENT_SECONDS = 7 * 24 * 60 * 60
 HEARTBEAT_SECONDS = 120
-LOCAL_SESSION_ICON = "\uf109"
-REMOTE_SESSION_ICON = "\U000f0e8a"
+MACHINE_PROFILES = {
+    "arkay": {"icon": "󰇅", "color": "38;2;126;203;255;1", "label": "thinkstation"},
+    "arnabthinkpad": {"icon": "󰌢", "color": "38;2;92;214;144;1", "label": "thinkpad"},
+    "macbook-air.local": {"icon": "󰀵", "color": "38;2;245;194;96;1", "label": "macbook"},
+    "macbook-air": {"icon": "󰀵", "color": "38;2;245;194;96;1", "label": "macbook"},
+}
+DEFAULT_MACHINE_PROFILE = {"icon": "", "color": "38;2;174;141;255;1", "label": "machine"}
 TEMPERATURE_REFRESH_SECONDS = 30
 LHM_WINGET_PACKAGE = (
     Path.home()
@@ -1692,8 +1697,28 @@ def session_location(session: dict[str, Any]) -> str:
     return "local" if session.get("machine_id") == machine_id() else "remote"
 
 
+def machine_profile(mid: str | None) -> dict[str, str]:
+    key = str(mid or "").strip().lower()
+    if key in MACHINE_PROFILES:
+        return MACHINE_PROFILES[key]
+    short_key = key.split(".")[0]
+    return MACHINE_PROFILES.get(short_key, DEFAULT_MACHINE_PROFILE)
+
+
+def machine_icon(mid: str | None) -> str:
+    return machine_profile(mid).get("icon", DEFAULT_MACHINE_PROFILE["icon"])
+
+
+def machine_color(mid: str | None) -> str:
+    return machine_profile(mid).get("color", DEFAULT_MACHINE_PROFILE["color"])
+
+
+def machine_kind_label(mid: str | None) -> str:
+    return machine_profile(mid).get("label", DEFAULT_MACHINE_PROFILE["label"])
+
+
 def session_location_icon(session: dict[str, Any]) -> str:
-    return LOCAL_SESSION_ICON if session_location(session) == "local" else REMOTE_SESSION_ICON
+    return machine_icon(str(session.get("machine_id") or ""))
 
 
 def session_activity_state(session: dict[str, Any], machines: dict[str, dict[str, Any]]) -> str:
@@ -2708,8 +2733,7 @@ class AnsiDashboardApp:
         return self.color(lifecycle, self.status_color(lifecycle))
 
     def location_badge(self, session: dict[str, Any]) -> str:
-        color = "38;2;126;203;255;1" if session_location(session) == "local" else "38;2;174;141;255;1"
-        return self.color(session_location_icon(session), color)
+        return self.color(session_location_icon(session), machine_color(str(session.get("machine_id") or "")))
 
     def draw_box_line(self, width: int, title: str = "") -> str:
         return self.color(self.plain_box(width, title), "38;2;76;154;180")
@@ -3265,6 +3289,9 @@ class AnsiDashboardApp:
     def colorized_usage_line(self, raw: str, color: str, accent: str) -> str:
         if raw.startswith(("╭", "╰", "â•­", "â•°")):
             return self.color(raw, color)
+        for mid, profile in MACHINE_PROFILES.items():
+            if f" {mid}" in raw or f" {mid.split('.')[0]}" in raw:
+                color = profile["color"]
         muted = "38;2;88;96;108"
         bar_pairs = {
             "━": "─",
@@ -3305,21 +3332,31 @@ class AnsiDashboardApp:
             raw_rows = ["Press u to load local Codex usage stats."]
         rows = []
         section_color = "38;2;220;224;232"
+        left_section_color = "38;2;220;224;232"
+        right_section_color = "38;2;220;224;232"
+
+        def section_accent(raw: str, fallback: str) -> str:
+            if "Local Codex Usage" in raw:
+                return "38;2;126;203;255"
+            if "Session Tokens" in raw:
+                return "38;2;174;141;255"
+            if "Token Mix" in raw:
+                return "38;2;92;214;144"
+            if "Useful Signals" in raw:
+                return "38;2;245;194;96"
+            if "Top Projects" in raw:
+                return "38;2;174;141;255"
+            if "Top Sessions" in raw:
+                return "38;2;126;203;255"
+            if "Machines" in raw:
+                return "38;2;238;132;94"
+            if "Local DB" in raw or "Logs" in raw:
+                return "38;2;150;158;171"
+            return fallback
 
         def usage_color(raw: str, heading: bool = False, rule: bool = False) -> str:
             nonlocal section_color
-            if "Session Tokens" in raw:
-                section_color = "38;2;126;203;255"
-            elif "Token Mix" in raw:
-                section_color = "38;2;92;214;144"
-            elif "Useful Signals" in raw:
-                section_color = "38;2;245;194;96"
-            elif "Leaders" in raw:
-                section_color = "38;2;174;141;255"
-            elif "Machines" in raw or "Recent" in raw:
-                section_color = "38;2;126;203;255"
-            elif "Local DB" in raw or "Logs" in raw:
-                section_color = "38;2;150;158;171"
+            section_color = section_accent(raw, section_color)
             if heading:
                 return "38;2;245;194;96;1"
             if rule:
@@ -3334,6 +3371,11 @@ class AnsiDashboardApp:
                 return "38;2;150;158;171"
             return "38;2;220;224;232"
 
+        def color_usage_segment(segment: str, color: str) -> str:
+            if not segment.strip():
+                return segment
+            return self.colorized_usage_line(segment, color, color)
+
         for index, raw in enumerate(raw_rows):
             if not raw:
                 rows.append(self.pane_row("", body_width, "38;2;126;203;255"))
@@ -3344,7 +3386,27 @@ class AnsiDashboardApp:
             color = usage_color(raw, heading=is_heading, rule=is_rule)
             if is_rule:
                 raw = "─" * inner_width
-            content = self.color(raw, color) if is_rule else self.colorized_usage_line(raw, color, section_color)
+            pair_split = None
+            if self.visible_len(raw) == inner_width and inner_width >= 88:
+                half_width = (inner_width - 2) // 2
+                left_probe = raw[:half_width].rstrip()
+                right_probe = raw[half_width + 2 :].lstrip()
+                if (
+                    raw[half_width : half_width + 2] == "  "
+                    and raw.startswith(("╭", "│", "╰"))
+                    and left_probe.endswith(("╮", "│", "╯"))
+                    and right_probe.startswith(("╭", "│", "╰"))
+                ):
+                    pair_split = half_width
+            if pair_split is not None:
+                left_raw = raw[:pair_split]
+                gap_raw = raw[pair_split : pair_split + 2]
+                right_raw = raw[pair_split + 2 :]
+                left_section_color = section_accent(left_raw, left_section_color)
+                right_section_color = section_accent(right_raw, right_section_color)
+                content = color_usage_segment(left_raw, left_section_color) + gap_raw + color_usage_segment(right_raw, right_section_color)
+            else:
+                content = self.color(raw, color) if is_rule else self.colorized_usage_line(raw, color, section_color)
             rows.append(self.pane_row(content, body_width, "38;2;126;203;255"))
         return rows
 
@@ -4540,6 +4602,19 @@ def usage_value_row(label: str, value: str, detail: str = "") -> str:
     return text
 
 
+def usage_plain_row(label: str, value: str, detail: str = "") -> str:
+    text = f"{label:<22.22} {value:>8}"
+    if detail:
+        text += f" {detail}"
+    return text
+
+
+def pad_usage_rows(rows: list[str], count: int) -> list[str]:
+    padded = list(rows[:count])
+    padded.extend("—" for _ in range(max(0, count - len(padded))))
+    return padded
+
+
 def usage_signal_row(label: str, display_value: str, value: float, maximum: float, detail: str = "", width: int = 74) -> str:
     bar = usage_bar(value, maximum)
     suffix = f" {detail}" if detail else ""
@@ -4679,12 +4754,13 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
     top_projects = top_session_groups(sessions, "project_id", month_ts, top)
     top_models = top_session_groups(sessions, "model", month_ts, top)
     top_machines = top_session_groups(sessions, "machine_id", month_ts, top)
-    recent_sessions = [
+    top_sessions = [
         (
-            str(session.get("generated_title") or session.get("title") or session.get("id") or "session")[:22],
+            str(session.get("generated_title") or session.get("title") or session.get("id") or "session"),
             f"{format_metric(float(session.get('total_tokens') or 0))} {session.get('project_id') or 'unknown'}",
         )
-        for session in sessions[:top]
+        for session in sorted(sessions, key=lambda row: float(row.get("total_tokens") or 0), reverse=True)
+        if float(session.get("total_tokens") or 0) > 0
     ]
 
     max_context_session = max(sessions, key=lambda row: float(row.get("context_used_percent") or 0), default={})
@@ -4711,13 +4787,30 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
         usage_value_row("󰓅 Last turn", format_metric(all_totals["last_tokens"])),
         f"󰹾 Indexed      {int(all_totals['active_sessions'])}/{int(all_totals['sessions'])} sessions",
     ]
-    project_rows = [usage_value_row(f"󰏗 {label:<10}"[:14], format_metric(value)) for label, value in top_projects[:top]]
     model_rows = [usage_value_row(f"󰚩 {label:<10}"[:14], format_metric(value)) for label, value in top_models[:top]]
-    machine_rows = [usage_value_row(f" {label:<10}"[:14], format_metric(value)) for label, value in top_machines[:top]]
-    recent_rows = [f"󰈙 {label:<22} {value}" for label, value in recent_sessions[:top]]
+    machine_rows = [usage_plain_row(f"{machine_icon(label)} {label}"[:22], format_metric(value), machine_kind_label(label)) for label, value in top_machines[:5]]
+    project_rows = [usage_plain_row(f"󰏗 {label}"[:22], format_metric(value)) for label, value in top_projects[:5]]
+    session_rows = [usage_plain_row(f"󰈙 {label}"[:22], value) for label, value in top_sessions[:5]]
+    machine_total = len({str(session.get("machine_id") or "unknown") for session in sessions})
+    machine_summary_rows = [
+        usage_plain_row(" Machines", str(machine_total)),
+        usage_plain_row("󰈙 Sessions", str(len(sessions))),
+        *pad_usage_rows(machine_rows, 3),
+    ]
+    account_label = current_account_label(machine_freshness())
+    local_summary_rows = [
+        usage_plain_row(f"{machine_icon(machine_id())} Local machine", machine_id(), machine_kind_label(machine_id())),
+        usage_plain_row("󰀄 Account", account_label),
+        f"󰋊 {CODEX_HOME}",
+        f"󰉋 {BOARD_HOME}",
+        f"Updated: {now.strftime('%Y-%m-%d %H:%M %Z')}",
+    ]
+    project_rows = pad_usage_rows(project_rows, 5)
+    session_rows = pad_usage_rows(session_rows, 5)
 
     if width >= 88:
         signal_card_width = max(24, (width - 2) // 2)
+        intro_cards = render_usage_card_pair("Local Codex Usage", local_summary_rows, " Machines", machine_summary_rows, width)
         top_cards = render_usage_columns("󰓅 Session Tokens", period_left, period_right, width)
         signal_cards = render_usage_card_pair(
             "󰋊 Token Mix",
@@ -4726,27 +4819,22 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
             [usage_signal_row(label, display, value, maximum, detail, max(20, signal_card_width - 4)) for label, display, value, maximum, detail in signal_rows],
             width,
         )
+        leaderboard_cards = render_usage_card_pair("󰏗 Top Projects", project_rows, "󰈙 Top Sessions", session_rows, width)
     else:
+        intro_cards = render_usage_card("Local Codex Usage", local_summary_rows, width) + [""] + render_usage_card(" Machines", machine_summary_rows, width)
         top_cards = render_usage_columns("󰓅 Session Tokens", period_left, period_right, width) + [""] + render_usage_columns("󰋊 Token Mix", token_left, token_right, width)
         signal_cards = render_usage_signal_card("󰌵 Useful Signals", signal_rows, width)
+        leaderboard_cards = render_usage_card("󰏗 Top Projects", project_rows, width) + [""] + render_usage_card("󰈙 Top Sessions", session_rows, width)
 
     lines = [
-        "Local Codex Usage",
-        f"󰋊 {CODEX_HOME}",
-        f"󰉋 {BOARD_HOME}",
-        f"Updated: {now.strftime('%Y-%m-%d %H:%M %Z')}",
+        *intro_cards,
         "",
         *top_cards,
         "",
         *signal_cards,
+        "",
+        *leaderboard_cards,
     ]
-    if width >= 88 and (project_rows or model_rows) and (machine_rows or recent_rows):
-        lines.extend(["", *render_usage_card_pair("󰏗 Leaders This Month", project_rows + model_rows, " Machines / Recent", machine_rows + recent_rows, width)])
-    else:
-        if project_rows or model_rows:
-            lines.extend(["", *render_usage_columns("󰏗 Leaders This Month", project_rows, model_rows, width)])
-        if machine_rows or recent_rows:
-            lines.extend(["", *render_usage_columns(" Machines / Recent", machine_rows, recent_rows, width)])
 
     thread_stats = read_local_thread_stats()
     state_rows: list[str] = []
