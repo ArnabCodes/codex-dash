@@ -38,6 +38,8 @@ DELETED_SESSIONS_PATH = BOARD_HOME / "deleted_sessions.json"
 USAGE_CACHE_PATH = BOARD_HOME / "usage_cache.json"
 RECENT_SECONDS = 7 * 24 * 60 * 60
 HEARTBEAT_SECONDS = 120
+LOCAL_SESSION_ICON = "\uf109"
+REMOTE_SESSION_ICON = "\U000f0e8a"
 TEMPERATURE_REFRESH_SECONDS = 30
 LHM_WINGET_PACKAGE = (
     Path.home()
@@ -1677,6 +1679,23 @@ def session_status(session: dict[str, Any], machines: dict[str, dict[str, Any]])
     return status
 
 
+def session_lifecycle(session: dict[str, Any], machines: dict[str, dict[str, Any]]) -> str:
+    status = session_status(session, machines)
+    if status.endswith("active"):
+        return "live"
+    if status == "recent":
+        return "ready"
+    return "stale"
+
+
+def session_location(session: dict[str, Any]) -> str:
+    return "local" if session.get("machine_id") == machine_id() else "remote"
+
+
+def session_location_icon(session: dict[str, Any]) -> str:
+    return LOCAL_SESSION_ICON if session_location(session) == "local" else REMOTE_SESSION_ICON
+
+
 def session_activity_state(session: dict[str, Any], machines: dict[str, dict[str, Any]]) -> str:
     status = session_status(session, machines)
     last_role = str(session.get("last_role") or "")
@@ -1792,13 +1811,14 @@ def command_list(args: argparse.Namespace) -> None:
         for subproject_id in sorted(grouped[project_id]):
             print(f"  {sub_names.get((project_id, subproject_id), subproject_id)} [{subproject_id}]")
             for session in grouped[project_id][subproject_id][: args.per_group]:
-                status = session_status(session, machines)
+                lifecycle = session_lifecycle(session, machines)
+                location = session_location_icon(session)
                 origin = launch_label(session)
                 activity = session_activity_label(session, machines)
                 tokens = token_summary_label(session) or "-"
                 print(
                     "    "
-                    f"{session['id']}  {status:13}  {activity:12.12}  {tokens:12.12}  {origin:16.16}  {session.get('machine_id','?')}  "
+                    f"{session['id']}  {location} {lifecycle:5}  {activity:12.12}  {tokens:12.12}  {origin:16.16}  {session.get('machine_id','?')}  "
                     f"{format_ts(session.get('updated_at'))}  {short_title(session.get('title',''))}"
                 )
 
@@ -1813,13 +1833,10 @@ def command_pick(args: argparse.Namespace) -> None:
     print("Codex sessions\n")
     visible = sessions[: args.limit]
     for index, session in enumerate(visible, 1):
-        machine = machines.get(session.get("machine_id"), {})
-        status = session.get("status", "unknown")
-        session_age = int(time.time()) - int(session.get("updated_at") or 0)
-        if machine.get("fresh") and machine.get("codex_processes") and session_age <= HEARTBEAT_SECONDS * 2:
-            status = "remote-active" if session.get("machine_id") != machine_id() else "local-active"
+        lifecycle = session_lifecycle(session, machines)
+        location = session_location_icon(session)
         print(
-            f"{index:2}. {status:13} {session.get('project_id')}/{session.get('subproject_id')} "
+            f"{index:2}. {location} {lifecycle:5} {session.get('project_id')}/{session.get('subproject_id')} "
             f"{launch_label(session)} {session.get('machine_id')} {format_ts(session.get('updated_at'))}"
         )
         print(f"    {short_title(session.get('title', ''), 100)}")
@@ -1852,9 +1869,9 @@ KEY_BINDINGS: list[tuple[str, str, str]] = [
     ("Panels", "[ / ]", "Cycle project filter"),
     ("Filters", "/", "Search sessions"),
     ("Filters", "n / N", "Next or previous search match"),
-    ("Filters", "s", "Cycle status filter"),
+    ("Filters", "s", "Cycle state filter"),
     ("Filters", "S", "Cycle sort mode"),
-    ("Filters", "a", "Show all projects and statuses"),
+    ("Filters", "a", "Show all projects and states"),
     ("Filters", "x", "Clear filters"),
     ("Projects", "c", "Create a project and context file"),
     ("Projects", "p", "Assign selected session to current/project id"),
@@ -2095,9 +2112,9 @@ class DashboardApp:
     def status_attr(self, status: str) -> int:
         import curses
 
-        if status.endswith("active"):
+        if status in {"live", "local-active", "remote-active"} or status.endswith("active"):
             return curses.color_pair(5) | curses.A_BOLD
-        if status == "recent":
+        if status in {"ready", "recent"}:
             return curses.color_pair(6)
         if status == "stale":
             return curses.color_pair(8)
@@ -2136,7 +2153,7 @@ class DashboardApp:
         inner_x = x + 2
         inner_width = max(1, width - 4)
         inner_height = max(1, height - 3)
-        header = f"{'#':>3} {'status':13} {'activity':12} {'project':24} {'machine':10} {'updated':16} title"
+        header = f"{'#':>3} {'loc':3} {'state':5} {'activity':12} {'project':24} {'machine':10} {'updated':16} title"
         self.safe_add(y + 1, inner_x, header.ljust(inner_width), inner_width, curses.color_pair(7) | curses.A_BOLD)
 
         if not self.visible:
@@ -2150,7 +2167,8 @@ class DashboardApp:
             row_y = inner_y + offset
             selected = self.top + offset == self.cursor
             attr = curses.color_pair(4) if selected else curses.color_pair(0)
-            status = session_status(session, self.machines)
+            status = session_lifecycle(session, self.machines)
+            location = session_location_icon(session)
             activity = session_activity_label(session, self.machines)
             if status == "stale" and not selected:
                 attr = curses.color_pair(8) | curses.A_DIM
@@ -2159,15 +2177,15 @@ class DashboardApp:
             machine = session.get("machine_id", "?")
             updated = format_ts(session.get("updated_at"))
             path = f"{project}/{subproject}"
-            title_width = max(12, inner_width - 87)
+            title_width = max(12, inner_width - 83)
             line = (
                 f"{self.top + offset + 1:>3} "
-                f"{status:13} {activity:12.12} {path:24.24} {machine:10.10} {updated:16} "
+                f"{location:3} {status:5} {activity:12.12} {path:24.24} {machine:10.10} {updated:16} "
                 f"{short_title(session.get('title', ''), title_width)}"
             )
             self.safe_add(row_y, inner_x, line.ljust(inner_width), inner_width, attr)
             if not selected:
-                self.safe_add(row_y, inner_x + 4, status[:13].ljust(13), 13, self.status_attr(status))
+                self.safe_add(row_y, inner_x + 8, status[:5].ljust(5), 5, self.status_attr(status))
 
         if len(self.visible) > inner_height:
             scroll = f" {self.cursor + 1}/{len(self.visible)} "
@@ -2182,7 +2200,7 @@ class DashboardApp:
             return
         project = session.get("project_id", "uncategorized")
         subproject = session.get("subproject_id", "default")
-        status = session_status(session, self.machines)
+        status = session_lifecycle(session, self.machines)
         activity = session_activity_label(session, self.machines)
         inner_y = y + 1
         inner_x = x + 2
@@ -2191,7 +2209,7 @@ class DashboardApp:
         self.safe_add(inner_y, inner_x, heading, inner_width, curses.color_pair(2) | curses.A_BOLD)
         lines = [
             f"id:      {session.get('id')}",
-            f"status:  {status} on {session.get('machine_id', '?')} at {format_ts(session.get('updated_at'))}",
+            f"status:  {session_location_icon(session)} {status} on {session.get('machine_id', '?')} at {format_ts(session.get('updated_at'))}",
             f"activity:{activity}",
             f"cwd:     {session.get('cwd') or ''}",
             f"branch:  {session.get('git_branch') or ''}",
@@ -2457,7 +2475,7 @@ class AnsiDashboardApp:
         if self.project_filter != "all":
             rows = [row for row in rows if row.get("project_id", "uncategorized") == self.project_filter]
         if self.status_filter != "all":
-            rows = [row for row in rows if session_status(row, self.machines) == self.status_filter]
+            rows = [row for row in rows if session_lifecycle(row, self.machines) == self.status_filter]
         if self.sort_mode == "project":
             rows.sort(
                 key=lambda row: (
@@ -2467,8 +2485,8 @@ class AnsiDashboardApp:
                 )
             )
         elif self.sort_mode == "status":
-            rank = {"local-active": 0, "remote-active": 1, "recent": 2, "stale": 3}
-            rows.sort(key=lambda row: (rank.get(session_status(row, self.machines), 9), -int(row.get("updated_at") or 0)))
+            rank = {"live": 0, "ready": 1, "stale": 2}
+            rows.sort(key=lambda row: (rank.get(session_lifecycle(row, self.machines), 9), session_location(row), -int(row.get("updated_at") or 0)))
         else:
             rows.sort(key=lambda row: int(row.get("updated_at") or 0), reverse=True)
         self.visible = rows
@@ -2524,6 +2542,10 @@ class AnsiDashboardApp:
     def block(self, text: str, fg: str, bg: str, bold: bool = True) -> str:
         weight = ";1" if bold else ""
         return self.color(text, f"38;2;{fg};48;2;{bg}{weight}")
+
+    def row_highlight(self, row: str, bg: str = "36;64;78") -> str:
+        bg_seq = f"\x1b[48;2;{bg}m"
+        return bg_seq + row.replace("\x1b[0m", "\x1b[0m" + bg_seq) + "\x1b[0m"
 
     @staticmethod
     def strip_ansi(text: str) -> str:
@@ -2651,9 +2673,9 @@ class AnsiDashboardApp:
         return rows
 
     def status_color(self, status: str) -> str:
-        if status.endswith("active"):
+        if status in {"live", "local-active", "remote-active"} or status.endswith("active"):
             return "38;2;92;214;144;1"
-        if status == "recent":
+        if status in {"ready", "recent"}:
             return "38;2;245;194;96"
         if status == "stale":
             return "38;2;150;158;171"
@@ -2681,6 +2703,13 @@ class AnsiDashboardApp:
             "stale": "○ stale",
         }.get(status, status)
         return self.color(label, self.status_color(status))
+
+    def lifecycle_badge(self, lifecycle: str) -> str:
+        return self.color(lifecycle, self.status_color(lifecycle))
+
+    def location_badge(self, session: dict[str, Any]) -> str:
+        color = "38;2;126;203;255;1" if session_location(session) == "local" else "38;2;174;141;255;1"
+        return self.color(session_location_icon(session), color)
 
     def draw_box_line(self, width: int, title: str = "") -> str:
         return self.color(self.plain_box(width, title), "38;2;76;154;180")
@@ -2714,7 +2743,7 @@ class AnsiDashboardApp:
     def project_counts(self) -> list[tuple[str, str, int]]:
         rows = filter_sessions(self.sessions, self.query)
         if self.status_filter != "all":
-            rows = [row for row in rows if session_status(row, self.machines) == self.status_filter]
+            rows = [row for row in rows if session_lifecycle(row, self.machines) == self.status_filter]
         counts: dict[str, int] = {}
         for session in rows:
             project = session.get("project_id", "uncategorized")
@@ -2738,13 +2767,13 @@ class AnsiDashboardApp:
         self.message = f"Project: {label}"
 
     def cycle_status(self, delta: int) -> None:
-        statuses = ["all", "local-active", "remote-active", "recent", "stale"]
+        statuses = ["all", "live", "ready", "stale"]
         index = statuses.index(self.status_filter) if self.status_filter in statuses else 0
         self.status_filter = statuses[(index + delta) % len(statuses)]
         self.cursor = 0
         self.top = 0
         self.apply_filter()
-        self.message = f"Status: {self.status_filter}"
+        self.message = f"State: {self.status_filter}"
 
     def cycle_sort(self) -> None:
         modes = ["updated", "project", "status"]
@@ -2967,8 +2996,8 @@ class AnsiDashboardApp:
         list_rows = max(1, height - 4)
         self.ensure_cursor_visible(list_rows)
         lines = [self.pane_top(width, "󰈙 Sessions", "sessions")]
-        title_width = max(12, inner_width - 78)
-        heading = f"{'#':>3} {'state':12} {'activity':12} {'tokens':9} {'scope':20} {'updated':16} {'title':{title_width}.{title_width}}"
+        title_width = max(12, inner_width - 76)
+        heading = f"{'#':>3} {'':2} {'state':5} {'activity':12} {'tokens':9} {'scope':20} {'updated':16} {'title':{title_width}.{title_width}}"
         lines.append(self.pane_row(self.color(heading, "38;2;126;203;255;1"), width, pane="sessions"))
 
         if not self.visible:
@@ -2977,11 +3006,11 @@ class AnsiDashboardApp:
         else:
             for offset, session in enumerate(self.visible[self.top : self.top + list_rows]):
                 index = self.top + offset
-                status = session_status(session, self.machines)
+                lifecycle = session_lifecycle(session, self.machines)
                 activity_state = session_activity_state(session, self.machines)
                 activity = session_activity_label(session, self.machines, self.spinner_index)
                 tokens = token_summary_label(session) or "-"
-                muted = status == "stale"
+                muted = lifecycle == "stale"
                 text_color = "38;2;120;128;140;2" if muted else "38;2;238;241;245"
                 meta_color = "38;2;105;112;124;2" if muted else "38;2;150;158;171"
                 scope_color = "38;2;130;137;148;2" if muted else "38;2;220;224;232"
@@ -2990,7 +3019,9 @@ class AnsiDashboardApp:
                 row = (
                     self.color(f"{index + 1:>3}", meta_color)
                     + " "
-                    + self.fit_ansi(self.status_badge(status, session), 12)
+                    + self.fit_ansi(self.location_badge(session), 2)
+                    + " "
+                    + self.fit_ansi(self.lifecycle_badge(lifecycle), 5)
                     + " "
                     + self.fit_ansi(self.color(activity, self.activity_color(activity_state)), 12)
                     + " "
@@ -3003,7 +3034,7 @@ class AnsiDashboardApp:
                     + self.color(f"{title:{title_width}.{title_width}}", text_color)
                 )
                 if index == self.cursor:
-                    lines.append(self.pane_row(self.color("▌ " + self.fit_ansi(row, inner_width - 2), "30;48;2;126;203;255;1"), width, pane="sessions"))
+                    lines.append(self.pane_row(self.row_highlight(self.fit_ansi(row, inner_width)), width, pane="sessions"))
                 else:
                     lines.append(self.pane_row(row, width, pane="sessions"))
         lines.extend(self.pane_row("", width, pane="sessions") for _ in range(max(0, height - len(lines) - 1)))
@@ -3045,7 +3076,7 @@ class AnsiDashboardApp:
         else:
             project = session.get("project_id", "uncategorized")
             subproject = session.get("subproject_id", "default")
-            status = session_status(session, self.machines)
+            lifecycle = session_lifecycle(session, self.machines)
             activity = session_activity_label(session, self.machines, self.spinner_index)
             token_label = token_summary_label(session) or "none"
             rate_label = rate_summary_label(session) or "none"
@@ -3055,7 +3086,7 @@ class AnsiDashboardApp:
             lines.append(self.pane_row(self.color(f"{project_icon} {project_name}  󰝰 {self.sub_names.get((project, subproject), subproject)}", "38;2;126;203;255;1"), width, pane="details"))
             fields = [
                 ("󰌷 id", str(session.get("id"))),
-                ("󰄬 status", f"{self.strip_ansi(self.status_badge(status, session))}  {session.get('machine_id', '?')}  {format_ts(session.get('updated_at'))}"),
+                ("󰄬 status", f"{session_location_icon(session)} {lifecycle}  {session.get('machine_id', '?')}  {format_ts(session.get('updated_at'))}"),
                 ("󰔟 activity", activity),
                 ("󰀄 account", account_label),
                 ("󰓅 tokens", f"{token_label}; last {compact_number(session.get('last_tokens')) or '0'}; in {compact_number(session.get('input_tokens')) or '0'} cached {compact_number(session.get('cached_input_tokens')) or '0'} out {compact_number(session.get('output_tokens')) or '0'} reason {compact_number(session.get('reasoning_output_tokens')) or '0'}"),
@@ -3102,7 +3133,7 @@ class AnsiDashboardApp:
         sidebar_width = 28 if width >= 96 else 0
         gap = 1 if sidebar_width else 0
         list_width = width - sidebar_width - gap
-        title = self.chip(" ◈ Codex Dashboard ", "238;241;245", "24;31;44")
+        title = self.block("  ◈ Codex Dashboard  ", "238;241;245", "24;31;44")
         counts = self.chip(f" 󰈙 {len(self.visible)}/{len(self.sessions)} ", "24;31;44", "126;203;255")
         machine = self.chip(f"  {machine_id()} ", "24;31;44", "92;214;144")
         chips = self.filter_chips()
@@ -4027,7 +4058,7 @@ class AnsiDashboardApp:
                     self.cursor = 0
                     self.top = 0
                     self.apply_filter()
-                    self.message = "Filters: all projects, all statuses"
+                    self.message = "Filters: all projects, all states"
                 elif key == "x":
                     self.query = ""
                     self.project_filter = "all"
@@ -4686,9 +4717,18 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
     recent_rows = [f"󰈙 {label:<22} {value}" for label, value in recent_sessions[:top]]
 
     if width >= 88:
-        top_cards = render_usage_card_pair("󰓅 Session Tokens", period_rows, "󰋊 Token Mix", token_left + token_right, width)
+        signal_card_width = max(24, (width - 2) // 2)
+        top_cards = render_usage_columns("󰓅 Session Tokens", period_left, period_right, width)
+        signal_cards = render_usage_card_pair(
+            "󰋊 Token Mix",
+            token_left + token_right,
+            "󰌵 Useful Signals",
+            [usage_signal_row(label, display, value, maximum, detail, max(20, signal_card_width - 4)) for label, display, value, maximum, detail in signal_rows],
+            width,
+        )
     else:
         top_cards = render_usage_columns("󰓅 Session Tokens", period_left, period_right, width) + [""] + render_usage_columns("󰋊 Token Mix", token_left, token_right, width)
+        signal_cards = render_usage_signal_card("󰌵 Useful Signals", signal_rows, width)
 
     lines = [
         "Local Codex Usage",
@@ -4698,7 +4738,7 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
         "",
         *top_cards,
         "",
-        *render_usage_signal_card("󰌵 Useful Signals", signal_rows, width),
+        *signal_cards,
     ]
     if width >= 88 and (project_rows or model_rows) and (machine_rows or recent_rows):
         lines.extend(["", *render_usage_card_pair("󰏗 Leaders This Month", project_rows + model_rows, " Machines / Recent", machine_rows + recent_rows, width)])
