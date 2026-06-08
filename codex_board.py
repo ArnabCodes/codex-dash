@@ -3258,8 +3258,8 @@ class AnsiDashboardApp:
         rows.append(self.pane_row(hint, body_width, border))
         rows.append(self.color(self.bottom_box(body_width), border + ";1"))
         if max_top > 0 and body_width >= 12:
-            track = self.color("▏", "38;2;74;80;90")
-            thumb = self.color("▏", "38;2;126;203;255;1")
+            track = self.color("┃", "38;2;74;80;90")
+            thumb = self.color("┃", "38;2;126;203;255;1")
             thumb_height = max(1, min(content_height, round(content_height * content_height / max(1, len(content_rows)))))
             thumb_top = 0 if max_top <= 0 else round((content_height - thumb_height) * scroll_top / max_top)
             bar_x = max(1, body_width - 2)
