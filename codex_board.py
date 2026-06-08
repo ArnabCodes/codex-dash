@@ -3257,6 +3257,17 @@ class AnsiDashboardApp:
         hint = self.color(f" {hint_left}  j/k scroll  Up/Down scroll  Esc back  q quit  {position} ", "38;2;24;31;44;48;2;126;203;255;1")
         rows.append(self.pane_row(hint, body_width, border))
         rows.append(self.color(self.bottom_box(body_width), border + ";1"))
+        if max_top > 0 and body_width >= 12:
+            track = self.color("▌▌", "38;2;88;96;108")
+            thumb = self.color("▌▌", "38;2;126;203;255;1")
+            thumb_height = max(1, min(content_height, round(content_height * content_height / max(1, len(content_rows)))))
+            thumb_top = 0 if max_top <= 0 else round((content_height - thumb_height) * scroll_top / max_top)
+            bar_x = max(1, body_width - 3)
+            for offset in range(content_height):
+                marker = thumb if thumb_top <= offset < thumb_top + thumb_height else track
+                row_index = 2 + offset
+                if row_index < len(rows):
+                    rows[row_index] = self.overlay_ansi_line(rows[row_index], marker, bar_x, 2)
 
         left = max(0, (width - body_width) // 2)
         top_y = max(0, (height - len(rows)) // 2)
@@ -3289,9 +3300,15 @@ class AnsiDashboardApp:
     def colorized_usage_line(self, raw: str, color: str, accent: str) -> str:
         if raw.startswith(("╭", "╰", "â•­", "â•°")):
             return self.color(raw, color)
+        machine_row_color = ""
         for mid, profile in MACHINE_PROFILES.items():
             if f" {mid}" in raw or f" {mid.split('.')[0]}" in raw:
-                color = profile["color"]
+                machine_row_color = profile["color"]
+                break
+        if machine_row_color and raw.startswith("│") and raw.endswith("│") and len(raw) >= 2:
+            return self.color(raw[0], color) + self.color(raw[1:-1], machine_row_color) + self.color(raw[-1], color)
+        if machine_row_color:
+            color = machine_row_color
         muted = "38;2;88;96;108"
         bar_pairs = {
             "━": "─",
@@ -4788,7 +4805,7 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
         f"󰹾 Indexed      {int(all_totals['active_sessions'])}/{int(all_totals['sessions'])} sessions",
     ]
     model_rows = [usage_value_row(f"󰚩 {label:<10}"[:14], format_metric(value)) for label, value in top_models[:top]]
-    machine_rows = [usage_plain_row(f"{machine_icon(label)} {label}"[:22], format_metric(value), machine_kind_label(label)) for label, value in top_machines[:5]]
+    machine_rows = [usage_plain_row(f"{machine_icon(label)} {label}"[:22], format_metric(value)) for label, value in top_machines[:5]]
     project_rows = [usage_plain_row(f"󰏗 {label}"[:22], format_metric(value)) for label, value in top_projects[:5]]
     session_rows = [usage_plain_row(f"󰈙 {label}"[:22], value) for label, value in top_sessions[:5]]
     machine_total = len({str(session.get("machine_id") or "unknown") for session in sessions})
