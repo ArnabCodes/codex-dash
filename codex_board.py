@@ -2223,12 +2223,26 @@ class DashboardApp:
         self.message = "Press q to quit"
 
     def safe_add(self, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
+        import curses
+
         if width <= 0:
             return
         height, screen_width = self.stdscr.getmaxyx()
         if y < 0 or y >= height or x >= screen_width:
             return
-        self.stdscr.addnstr(y, max(0, x), text, min(width, screen_width - max(0, x)), attr)
+        start_x = max(0, x)
+        max_width = min(width, screen_width - start_x)
+        if max_width <= 0:
+            return
+        try:
+            self.stdscr.addnstr(y, start_x, text, max_width, attr)
+        except curses.error:
+            if y == height - 1 and start_x + max_width >= screen_width and max_width > 1:
+                try:
+                    self.stdscr.addnstr(y, start_x, text, max_width - 1, attr)
+                except curses.error:
+                    pass
+            return
 
     def draw_box(self, y: int, x: int, height: int, width: int, title: str = "") -> None:
         import curses
@@ -3982,6 +3996,8 @@ class AnsiDashboardApp:
         win_key = self.read_windows_console_input(timeout)
         if win_key:
             return win_key
+        if platform.system().lower() != "windows":
+            return self.read_posix_key(timeout)
         import msvcrt
 
         deadline = time.time() + timeout
@@ -4029,6 +4045,44 @@ class AnsiDashboardApp:
                 "Q": "pagedown",
             }.get(code, "")
         return key
+
+    @staticmethod
+    def read_posix_key(timeout: float = 1.0) -> str:
+        import select
+
+        fd = sys.stdin.fileno()
+        readable, _, _ = select.select([fd], [], [], timeout)
+        if not readable:
+            return "tick"
+        key = os.read(fd, 1).decode("utf-8", "replace")
+        if key != "\x1b":
+            return key
+        seq = ""
+        deadline = time.time() + 0.05
+        while time.time() < deadline:
+            readable, _, _ = select.select([fd], [], [], max(0.0, deadline - time.time()))
+            if not readable:
+                break
+            seq += os.read(fd, 1).decode("utf-8", "replace")
+            deadline = time.time() + 0.01
+        if seq.startswith("[<"):
+            match = re.match(r"\[<(\d+);(\d+);(\d+)([mM])", seq)
+            if match:
+                button, x, y, suffix = match.groups()
+                return f"mouse:{button}:{x}:{y}:{suffix == 'm'}"
+        if seq in ("[A", "OA"):
+            return "up"
+        if seq in ("[B", "OB"):
+            return "down"
+        if seq in ("[D", "OD"):
+            return "left"
+        if seq in ("[C", "OC"):
+            return "right"
+        if seq in ("[5~",):
+            return "pageup"
+        if seq in ("[6~",):
+            return "pagedown"
+        return "\x1b" if not seq else "\x1b" + seq
 
     @staticmethod
     def read_windows_console_input(timeout: float = 1.0) -> str:
@@ -4146,6 +4200,30 @@ class AnsiDashboardApp:
         except Exception:
             pass
 
+    @staticmethod
+    def enable_posix_terminal_input() -> list[Any] | None:
+        if platform.system().lower() == "windows" or not sys.stdin.isatty():
+            return None
+        try:
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            original = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+            return original
+        except Exception:
+            return None
+
+    @staticmethod
+    def restore_posix_terminal_input(attrs: list[Any] | None) -> None:
+        if attrs is None or platform.system().lower() == "windows" or not sys.stdin.isatty():
+            return
+        try:
+            import termios
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attrs)
+        except Exception:
+            pass
+
     def run(self) -> None:
         if platform.system().lower() == "windows":
             os.system("")
@@ -4153,6 +4231,7 @@ class AnsiDashboardApp:
         self.start_background_refresh(force=True)
         pending_g = False
         original_input_mode = self.enable_windows_console_input()
+        original_posix_input_mode = self.enable_posix_terminal_input()
         print("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H", end="")
         try:
             while True:
@@ -4345,6 +4424,7 @@ class AnsiDashboardApp:
         finally:
             print("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h", end="", flush=True)
             self.restore_windows_console_input(original_input_mode)
+            self.restore_posix_terminal_input(original_posix_input_mode)
 
 
 def run_ansi_dashboard(args: argparse.Namespace) -> None:
@@ -4363,6 +4443,9 @@ def command_dashboard(args: argparse.Namespace) -> None:
         refresh_export_quiet(int(getattr(args, "limit", 500) or 500))
         args.per_group = args.per_group or 20
         command_list(args)
+        return
+    if os.environ.get("CODEX_DASH_UI", "ansi").strip().lower() != "curses":
+        run_ansi_dashboard(args)
         return
     try:
         import curses
