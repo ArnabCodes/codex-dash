@@ -930,7 +930,7 @@ def get_local_codex_processes() -> list[dict[str, Any]]:
     if platform.system().lower() != "windows":
         try:
             result = subprocess.run(
-                ["ps", "-axo", "pid=,ppid=,comm=,etime="],
+                ["ps", "-axo", "pid=,ppid=,command="],
                 check=False,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -942,9 +942,11 @@ def get_local_codex_processes() -> list[dict[str, Any]]:
         for line in result.stdout.splitlines():
             if "codex" not in line.lower():
                 continue
-            parts = line.split(None, 3)
+            parts = line.split(None, 2)
             if len(parts) >= 3:
-                rows.append({"pid": int(parts[0]), "parent_pid": int(parts[1]), "name": parts[2]})
+                command_line = parts[2]
+                command_name = Path(command_line.split()[0]).name if command_line.split() else ""
+                rows.append({"pid": int(parts[0]), "parent_pid": int(parts[1]), "name": command_name, "command_line": command_line})
         return rows
 
     ps = (
@@ -978,6 +980,18 @@ def get_local_codex_processes() -> list[dict[str, Any]]:
     ]
 
 
+SESSION_ID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
+
+
+def active_session_ids_from_processes(processes: list[dict[str, Any]]) -> list[str]:
+    ids: set[str] = set()
+    for process in processes:
+        command_line = str(process.get("command_line") or "")
+        for match in SESSION_ID_RE.findall(command_line):
+            ids.add(match.lower())
+    return sorted(ids)
+
+
 def export_state(args: argparse.Namespace) -> None:
     manifest = load_manifest()
     threads = read_threads(limit=args.limit)
@@ -985,12 +999,16 @@ def export_state(args: argparse.Namespace) -> None:
     exported = []
     now = int(time.time())
     hidden_ids = deleted_session_ids()
+    processes = get_local_codex_processes()
+    active_session_ids = active_session_ids_from_processes(processes)
+    active_session_id_set = set(active_session_ids)
     summary_cache = load_summaries()
     cached_sessions = summary_cache.setdefault("sessions", {})
     launches = load_launches().get("sessions", {})
     current_account = load_current_account()
     for thread in threads:
-        if str(thread.get("id") or "") in hidden_ids:
+        thread_id = str(thread.get("id") or "")
+        if thread_id in hidden_ids and thread_id.lower() not in active_session_id_set:
             continue
         project_id, subproject_id = classify_thread(thread, manifest)
         title = thread.get("title") or thread.get("first_user_message") or thread.get("preview") or ""
@@ -1087,7 +1105,6 @@ def export_state(args: argparse.Namespace) -> None:
         encoding="utf-8",
     )
 
-    processes = get_local_codex_processes()
     (MACHINES_DIR / f"{current_machine}.json").write_text(
         json.dumps(
             {
@@ -1098,6 +1115,7 @@ def export_state(args: argparse.Namespace) -> None:
                 "account": current_account,
                 "latest_usage": latest_usage_snapshot(exported),
                 "codex_processes": processes,
+                "active_session_ids": active_session_ids,
             },
             indent=2,
         ),
@@ -1231,21 +1249,30 @@ def board_state_signature() -> tuple[int, int, int, int, int]:
     return count, max_mtime, total_size, manifest_mtime, peers_mtime
 
 
-def run_external(command: list[str], quiet: bool = False) -> bool:
+def run_external_result(command: list[str], quiet: bool = False, timeout: float | None = None) -> tuple[bool, str]:
     if not quiet:
         print(" ".join(command), flush=True)
-    result = subprocess.run(
-        command,
-        check=False,
-        text=True,
-        stdout=subprocess.DEVNULL if quiet else None,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.DEVNULL if quiet else None,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Timed out after {timeout:g}s: {' '.join(command)}"
     if result.returncode != 0 and not quiet:
         error = (result.stderr or "").strip()
         if error:
             print(error, file=sys.stderr)
-    return result.returncode == 0
+    return result.returncode == 0, (result.stderr or "").strip()
+
+
+def run_external(command: list[str], quiet: bool = False) -> bool:
+    ok, _ = run_external_result(command, quiet=quiet)
+    return ok
 
 
 def ps_single_quote(value: str) -> str:
@@ -1270,6 +1297,54 @@ def remote_mkdir_command(remote_board_path: str) -> str:
         "| Out-Null"
     )
     return f"powershell -NoProfile -ExecutionPolicy Bypass -Command {json.dumps(command)}"
+
+
+def remote_text_file_command(remote_file: str) -> str:
+    ps = f"Get-Content -LiteralPath {ps_single_quote(remote_file)} -Raw -Encoding UTF8"
+    return f"powershell -NoProfile -ExecutionPolicy Bypass -Command {json.dumps(ps)}"
+
+
+def remote_text_file(target: str, remote_file: str, timeout: float = 15.0) -> tuple[str | None, str]:
+    result = subprocess.run(
+        ["ssh", target, remote_text_file_command(remote_file)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        return None, (result.stderr or "").strip()
+    return result.stdout, ""
+
+
+def pull_remote_json_folder(
+    target: str,
+    remote_folder: str,
+    local_folder: Path,
+    expected_names: set[str],
+) -> tuple[bool, str]:
+    ok = True
+    errors: list[str] = []
+    remote_base = remote_folder.rstrip("/\\")
+    for filename in sorted(expected_names):
+        remote_file = remote_base + "/" + filename
+        try:
+            contents, read_error = remote_text_file(target, remote_file)
+        except subprocess.TimeoutExpired:
+            contents, read_error = None, f"Timed out reading {target}:{remote_file}"
+        if contents is None:
+            ok = False
+            if read_error:
+                errors.append(read_error)
+            continue
+        try:
+            json.loads(contents)
+            (local_folder / filename).write_text(contents, encoding="utf-8")
+        except Exception as exc:
+            ok = False
+            errors.append(f"{target}:{remote_file}: {exc}")
+    return ok, "\n".join(errors)
 
 
 def sync_peers_from_args(args: argparse.Namespace) -> list[dict[str, str]]:
@@ -1358,21 +1433,31 @@ def sync_state_once(args: argparse.Namespace) -> bool:
 
         if not getattr(args, "skip_remote_refresh", False):
             remote_refresh = remote_refresh_command(limit, remote_board_path, remote_codex_home)
-            remote_ok = run_external(["ssh", target, remote_refresh], quiet=quiet)
+            remote_ok, remote_error = run_external_result(["ssh", target, remote_refresh], quiet=quiet, timeout=20.0)
             ok = ok and remote_ok
+            if remote_error and not quiet:
+                print(f"Remote refresh failed for {target}: {remote_error}", file=sys.stderr)
 
         if direction in {"pull", "both"}:
-            pull_machines = run_external(
-                ["scp", "-q", f"{target}:{remote_board_path}/machines/*.json", str(machines_dir) + os.sep],
-                quiet=True,
+            peer_json_names = {f"{target}.json"}
+            pull_machines, pull_machines_error = pull_remote_json_folder(
+                target,
+                remote_board_path.rstrip("/\\") + "/machines",
+                machines_dir,
+                peer_json_names,
             )
-            pull_sessions = run_external(
-                ["scp", "-q", f"{target}:{remote_board_path}/sessions/*.json", str(sessions_dir) + os.sep],
-                quiet=True,
+            pull_sessions, pull_sessions_error = pull_remote_json_folder(
+                target,
+                remote_board_path.rstrip("/\\") + "/sessions",
+                sessions_dir,
+                peer_json_names,
             )
             ok = ok and pull_machines and pull_sessions
             if not quiet and not (pull_machines and pull_sessions):
                 print(f"Warning: could not pull all board files from {target}", file=sys.stderr)
+                for error in (pull_machines_error, pull_sessions_error):
+                    if error:
+                        print(error, file=sys.stderr)
 
         if direction in {"push", "both"}:
             machine_files = [str(path) for path in machines_dir.glob("*.json")]
@@ -1400,12 +1485,19 @@ def read_json_files(folder: Path) -> list[dict[str, Any]]:
 def all_sessions() -> list[dict[str, Any]]:
     assignments = load_assignments().get("sessions", {})
     launches = load_launches().get("sessions", {})
+    active_by_machine = {
+        str(payload.get("machine_id") or ""): {str(value).lower() for value in payload.get("active_session_ids", []) if value}
+        for payload in read_json_files(MACHINES_DIR)
+    }
+    active_anywhere = set().union(*active_by_machine.values()) if active_by_machine else set()
     hidden_ids = deleted_session_ids()
     sessions = []
     for payload in read_json_files(SESSIONS_DIR):
         for session in payload.get("sessions", []):
             session_id = session.get("id")
-            if session_id and str(session_id) in hidden_ids:
+            session_key = str(session_id) if session_id else ""
+            session_active = session_key.lower() in active_anywhere
+            if session_key and session_key in hidden_ids and not session_active:
                 continue
             assigned = assignments.get(session_id) if session_id else None
             if isinstance(assigned, dict):
@@ -1679,6 +1771,22 @@ def session_status(session: dict[str, Any], machines: dict[str, dict[str, Any]])
     status = session.get("status", "unknown")
     session_age = int(time.time()) - int(session.get("updated_at") or 0)
     recently_touched = session_age <= HEARTBEAT_SECONDS * 2
+    session_id = str(session.get("id") or "").lower()
+    active_ids = {str(value).lower() for value in machine.get("active_session_ids", []) if value}
+    process_open = bool(session_id and session_id in active_ids)
+    if machine.get("fresh") and process_open:
+        if recently_touched:
+            return "remote-active" if session.get("machine_id") != machine_id() else "local-active"
+        return "open"
+    if session_id:
+        for _mid, payload in machines.items():
+            if not payload.get("fresh"):
+                continue
+            payload_active_ids = {str(value).lower() for value in payload.get("active_session_ids", []) if value}
+            if session_id in payload_active_ids:
+                if recently_touched:
+                    return "remote-active" if session.get("machine_id") != machine_id() else "local-active"
+                return "open"
     if machine.get("fresh") and machine.get("codex_processes") and recently_touched:
         return "remote-active" if session.get("machine_id") != machine_id() else "local-active"
     return status
@@ -1688,6 +1796,8 @@ def session_lifecycle(session: dict[str, Any], machines: dict[str, dict[str, Any
     status = session_status(session, machines)
     if status.endswith("active"):
         return "live"
+    if status == "open":
+        return "open"
     if status == "recent":
         return "ready"
     return "stale"
@@ -2409,6 +2519,7 @@ class AnsiDashboardApp:
         self.temperature_status: dict[str, float] = {}
         self.sessions: list[dict[str, Any]] = []
         self.visible: list[dict[str, Any]] = []
+        self.session_presence: dict[str, list[dict[str, Any]]] = {}
         self.manifest: dict[str, Any] = {"projects": []}
         self.machines: dict[str, dict[str, Any]] = {}
         self.names: dict[str, str] = {}
@@ -2418,6 +2529,7 @@ class AnsiDashboardApp:
         self.manifest = load_manifest()
         self.machines = machine_freshness()
         self.sessions = all_sessions()
+        self.session_presence = self.build_session_presence(self.sessions)
         self.names, self.sub_names = manifest_names(self.manifest)
         self.last_board_signature = board_state_signature()
         self.apply_filter()
@@ -2510,7 +2622,7 @@ class AnsiDashboardApp:
                 )
             )
         elif self.sort_mode == "status":
-            rank = {"live": 0, "ready": 1, "stale": 2}
+            rank = {"live": 0, "open": 1, "ready": 2, "stale": 3}
             rows.sort(key=lambda row: (rank.get(session_lifecycle(row, self.machines), 9), session_location(row), -int(row.get("updated_at") or 0)))
         else:
             rows.sort(key=lambda row: int(row.get("updated_at") or 0), reverse=True)
@@ -2534,6 +2646,45 @@ class AnsiDashboardApp:
         if not self.visible:
             return None
         return self.visible[self.cursor]
+
+    def build_session_presence(self, sessions: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, dict[str, dict[str, Any]]] = {}
+        for session in sessions:
+            session_id = str(session.get("id") or "")
+            machine = str(session.get("machine_id") or "")
+            if not session_id or not machine:
+                continue
+            per_machine = grouped.setdefault(session_id, {})
+            current = per_machine.get(machine)
+            if current is None or int(session.get("updated_at") or 0) >= int(current.get("updated_at") or 0):
+                per_machine[machine] = session
+        now_epoch = int(time.time())
+        for mid, payload in self.machines.items():
+            if not payload.get("fresh"):
+                continue
+            for active_id in payload.get("active_session_ids", []) or []:
+                session_id = str(active_id or "")
+                if not session_id:
+                    continue
+                per_machine = grouped.get(session_id)
+                if not per_machine or mid in per_machine:
+                    continue
+                source = max(per_machine.values(), key=lambda row: int(row.get("updated_at") or 0))
+                presence_row = dict(source)
+                presence_row["machine_id"] = mid
+                presence_row["host_machine_id"] = mid
+                presence_row["updated_at"] = max(int(source.get("updated_at") or 0), now_epoch)
+                presence_row["status"] = "open"
+                presence_row["_presence_only"] = True
+                presence_row["_process_open"] = True
+                per_machine[mid] = presence_row
+        result: dict[str, list[dict[str, Any]]] = {}
+        local = machine_id()
+        for session_id, per_machine in grouped.items():
+            rows = list(per_machine.values())
+            rows.sort(key=lambda row: (0 if str(row.get("machine_id") or "") == local else 1, str(row.get("machine_id") or "")))
+            result[session_id] = rows
+        return result
 
     @staticmethod
     def term_size() -> tuple[int, int]:
@@ -2700,6 +2851,8 @@ class AnsiDashboardApp:
     def status_color(self, status: str) -> str:
         if status in {"live", "local-active", "remote-active"} or status.endswith("active"):
             return "38;2;92;214;144;1"
+        if status == "open":
+            return "38;2;126;203;255"
         if status in {"ready", "recent"}:
             return "38;2;245;194;96"
         if status == "stale":
@@ -2722,10 +2875,10 @@ class AnsiDashboardApp:
         if origin in {"tmux", "ssh", "remote"}:
             return self.color(origin, self.status_color(status))
         label = {
-            "local-active": " local",
-            "remote-active": " remote",
-            "recent": "● recent",
-            "stale": "○ stale",
+            "local-active": "local",
+            "remote-active": "remote",
+            "recent": "recent",
+            "stale": "stale",
         }.get(status, status)
         return self.color(label, self.status_color(status))
 
@@ -2734,6 +2887,41 @@ class AnsiDashboardApp:
 
     def location_badge(self, session: dict[str, Any]) -> str:
         return self.color(session_location_icon(session), machine_color(str(session.get("machine_id") or "")))
+
+    def presence_badge(self, session: dict[str, Any], width: int = 6) -> str:
+        session_id = str(session.get("id") or "")
+        rows = self.session_presence.get(session_id) or [session]
+        parts: list[str] = []
+        max_icons = max(1, (width + 1) // 2)
+        for row in rows[:max_icons]:
+            machine = str(row.get("machine_id") or "")
+            icon = machine_icon(machine)
+            state = session_activity_state(row, self.machines)
+            lifecycle = session_lifecycle(row, self.machines)
+            if lifecycle == "live" and state in {"working", "waiting"}:
+                color = machine_color(machine) + ";1"
+            elif lifecycle == "open" or row.get("_process_open"):
+                color = machine_color(machine)
+            else:
+                color = "38;2;105;112;124;2"
+            parts.append(self.color(icon, color))
+        if len(rows) > max_icons:
+            parts.append(self.color("+", "38;2;105;112;124;2"))
+        return " ".join(parts)
+
+    def presence_summary(self, session: dict[str, Any], width: int = 80) -> str:
+        session_id = str(session.get("id") or "")
+        rows = self.session_presence.get(session_id) or [session]
+        parts = []
+        for row in rows:
+            machine = str(row.get("machine_id") or "?")
+            state = session_activity_state(row, self.machines)
+            lifecycle = session_lifecycle(row, self.machines)
+            status = "open" if lifecycle == "open" or row.get("_process_open") else state if lifecycle == "live" else "inactive"
+            if state in {"done", "closed"}:
+                status = state
+            parts.append(f"{machine_icon(machine)} {machine} {status}")
+        return short_title(" · ".join(parts), width)
 
     def draw_box_line(self, width: int, title: str = "") -> str:
         return self.color(self.plain_box(width, title), "38;2;76;154;180")
@@ -2791,7 +2979,7 @@ class AnsiDashboardApp:
         self.message = f"Project: {label}"
 
     def cycle_status(self, delta: int) -> None:
-        statuses = ["all", "live", "ready", "stale"]
+        statuses = ["all", "live", "open", "ready", "stale"]
         index = statuses.index(self.status_filter) if self.status_filter in statuses else 0
         self.status_filter = statuses[(index + delta) % len(statuses)]
         self.cursor = 0
@@ -3020,8 +3208,9 @@ class AnsiDashboardApp:
         list_rows = max(1, height - 4)
         self.ensure_cursor_visible(list_rows)
         lines = [self.pane_top(width, "󰈙 Sessions", "sessions")]
-        title_width = max(12, inner_width - 76)
-        heading = f"{'#':>3} {'':2} {'state':5} {'activity':12} {'tokens':9} {'scope':20} {'updated':16} {'title':{title_width}.{title_width}}"
+        presence_width = 9
+        title_width = max(12, inner_width - 79 - presence_width)
+        heading = f"{'#':>3} {'on':{presence_width}} {'state':5} {'activity':12} {'tokens':9} {'scope':20} {'updated':16} {'title':{title_width}.{title_width}}"
         lines.append(self.pane_row(self.color(heading, "38;2;126;203;255;1"), width, pane="sessions"))
 
         if not self.visible:
@@ -3043,7 +3232,7 @@ class AnsiDashboardApp:
                 row = (
                     self.color(f"{index + 1:>3}", meta_color)
                     + " "
-                    + self.fit_ansi(self.location_badge(session), 2)
+                    + self.fit_ansi(self.presence_badge(session, presence_width), presence_width)
                     + " "
                     + self.fit_ansi(self.lifecycle_badge(lifecycle), 5)
                     + " "
