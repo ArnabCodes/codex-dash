@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -33,6 +34,7 @@ ASSIGNMENTS_PATH = BOARD_HOME / "assignments.json"
 SUMMARIES_PATH = BOARD_HOME / "summaries.json"
 PROJECTS_DIR = BOARD_HOME / "projects"
 LAUNCHES_PATH = BOARD_HOME / "launches.json"
+PENDING_LAUNCHES_PATH = BOARD_HOME / "pending_launches.json"
 PEERS_PATH = BOARD_HOME / "peers.json"
 DELETED_SESSIONS_PATH = BOARD_HOME / "deleted_sessions.json"
 USAGE_CACHE_PATH = BOARD_HOME / "usage_cache.json"
@@ -323,6 +325,26 @@ def load_launches() -> dict[str, Any]:
 def save_launches(data: dict[str, Any]) -> None:
     LAUNCHES_PATH.parent.mkdir(parents=True, exist_ok=True)
     LAUNCHES_PATH.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def load_pending_launches() -> dict[str, Any]:
+    if not PENDING_LAUNCHES_PATH.exists():
+        return {"launches": []}
+    try:
+        data = json.loads(PENDING_LAUNCHES_PATH.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {"launches": []}
+    if not isinstance(data, dict):
+        return {"launches": []}
+    launches = data.get("launches")
+    data["launches"] = launches if isinstance(launches, list) else []
+    return data
+
+
+def save_pending_launches(data: dict[str, Any]) -> None:
+    PENDING_LAUNCHES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    data["launches"] = list(data.get("launches") or [])[-100:]
+    PENDING_LAUNCHES_PATH.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def load_deleted_sessions() -> dict[str, Any]:
@@ -1279,18 +1301,34 @@ def ps_single_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def remote_refresh_command(limit: int, remote_board_path: str, remote_codex_home: str) -> str:
+def remote_refresh_command(limit: int, remote_board_path: str, remote_codex_home: str, remote_shell: str = "powershell") -> str:
+    if remote_shell == "sh":
+        env = []
+        if remote_board_path:
+            env.append(f"CODEX_BOARD_HOME={shlex.quote(remote_board_path)}")
+        if remote_codex_home:
+            env.append(f"CODEX_HOME={shlex.quote(remote_codex_home)}")
+        prefix = " ".join(env)
+        script = f"{remote_board_path.rstrip('/')}/codex_board.py" if remote_board_path else "codex_board.py"
+        command = f"{prefix} python3 {shlex.quote(script)} refresh --quiet --limit {int(limit)}".strip()
+        return f"sh -lc {shlex.quote(command)}"
+
     statements = []
     if remote_board_path:
         statements.append(f"$env:CODEX_BOARD_HOME={ps_single_quote(remote_board_path)}")
     if remote_codex_home:
         statements.append(f"$env:CODEX_HOME={ps_single_quote(remote_codex_home)}")
-    statements.append(f"codex-dash refresh --quiet --limit {int(limit)}")
+    script = (remote_board_path.rstrip("/\\") + "/codex_board.py") if remote_board_path else "codex_board.py"
+    statements.append(f"python {ps_single_quote(script)} refresh --quiet --limit {int(limit)}")
     command = "; ".join(statements)
     return f"powershell -NoProfile -ExecutionPolicy Bypass -Command {json.dumps(command)}"
 
 
-def remote_mkdir_command(remote_board_path: str) -> str:
+def remote_mkdir_command(remote_board_path: str, remote_shell: str = "powershell") -> str:
+    if remote_shell == "sh":
+        paths = f"{shlex.quote(remote_board_path + '/machines')} {shlex.quote(remote_board_path + '/sessions')}"
+        return f"sh -lc {shlex.quote('mkdir -p ' + paths)}"
+
     command = (
         "New-Item -ItemType Directory -Force "
         f"-Path {ps_single_quote(remote_board_path + '/machines')},{ps_single_quote(remote_board_path + '/sessions')} "
@@ -1299,14 +1337,41 @@ def remote_mkdir_command(remote_board_path: str) -> str:
     return f"powershell -NoProfile -ExecutionPolicy Bypass -Command {json.dumps(command)}"
 
 
-def remote_text_file_command(remote_file: str) -> str:
+def remote_json_list_command(remote_folder: str, remote_shell: str = "powershell") -> str:
+    if remote_shell == "sh":
+        command = f"find {shlex.quote(remote_folder)} -maxdepth 1 -type f -name '*.json' -print"
+        return f"sh -lc {shlex.quote(command)}"
+    ps = (
+        f"Get-ChildItem -LiteralPath {ps_single_quote(remote_folder)} -Filter *.json -File -ErrorAction SilentlyContinue | "
+        "ForEach-Object { $_.FullName.Replace([char]92, '/') }"
+    )
+    return f"powershell -NoProfile -ExecutionPolicy Bypass -Command {json.dumps(ps)}"
+
+
+def remote_text_file_command(remote_file: str, remote_shell: str = "powershell") -> str:
+    if remote_shell == "sh":
+        return f"sh -lc {shlex.quote('cat ' + shlex.quote(remote_file))}"
     ps = f"Get-Content -LiteralPath {ps_single_quote(remote_file)} -Raw -Encoding UTF8"
     return f"powershell -NoProfile -ExecutionPolicy Bypass -Command {json.dumps(ps)}"
 
 
-def remote_text_file(target: str, remote_file: str, timeout: float = 15.0) -> tuple[str | None, str]:
+def remote_json_files(target: str, remote_folder: str, remote_shell: str = "powershell", timeout: float = 10.0) -> tuple[list[str], str]:
     result = subprocess.run(
-        ["ssh", target, remote_text_file_command(remote_file)],
+        ["ssh", target, remote_json_list_command(remote_folder, remote_shell)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        return [], (result.stderr or "").strip()
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()], ""
+
+
+def remote_text_file(target: str, remote_file: str, remote_shell: str = "powershell", timeout: float = 15.0) -> tuple[str | None, str]:
+    result = subprocess.run(
+        ["ssh", target, remote_text_file_command(remote_file, remote_shell)],
         check=False,
         text=True,
         stdout=subprocess.PIPE,
@@ -1322,21 +1387,36 @@ def pull_remote_json_folder(
     target: str,
     remote_folder: str,
     local_folder: Path,
-    expected_names: set[str],
+    remote_shell: str = "powershell",
+    quiet: bool = False,
+    expected_names: set[str] | None = None,
 ) -> tuple[bool, str]:
+    if expected_names:
+        remote_base = remote_folder.rstrip("/\\")
+        files = [remote_base + "/" + name for name in sorted(expected_names)]
+    else:
+        try:
+            files, error = remote_json_files(target, remote_folder, remote_shell)
+        except subprocess.TimeoutExpired:
+            return False, f"Timed out listing {target}:{remote_folder}"
+        if error:
+            return False, error
+    if not files:
+        return True, ""
     ok = True
     errors: list[str] = []
-    remote_base = remote_folder.rstrip("/\\")
-    for filename in sorted(expected_names):
-        remote_file = remote_base + "/" + filename
+    for remote_file in files:
         try:
-            contents, read_error = remote_text_file(target, remote_file)
+            contents, read_error = remote_text_file(target, remote_file, remote_shell)
         except subprocess.TimeoutExpired:
             contents, read_error = None, f"Timed out reading {target}:{remote_file}"
         if contents is None:
             ok = False
             if read_error:
                 errors.append(read_error)
+            continue
+        filename = remote_file.rstrip("/\\").replace("\\", "/").split("/")[-1]
+        if not filename.endswith(".json"):
             continue
         try:
             json.loads(contents)
@@ -1357,6 +1437,7 @@ def sync_peers_from_args(args: argparse.Namespace) -> list[dict[str, str]]:
                     "target": target,
                     "remote_board_path": str(getattr(args, "remote_board_path", "~/.codex/instance-board") or "~/.codex/instance-board"),
                     "remote_codex_home": str(getattr(args, "remote_codex_home", "") or ""),
+                    "remote_shell": str(getattr(args, "remote_shell", "powershell") or "powershell"),
                     "local_board_path": str(getattr(args, "local_board_path", "") or ""),
                     "local_codex_home": str(getattr(args, "local_codex_home", "") or ""),
                 }
@@ -1375,6 +1456,7 @@ def sync_peers_from_args(args: argparse.Namespace) -> list[dict[str, str]]:
                 "target": target,
                 "remote_board_path": str(peer.get("remote_board_path") or "~/.codex/instance-board"),
                 "remote_codex_home": str(peer.get("remote_codex_home") or ""),
+                "remote_shell": str(peer.get("remote_shell") or "powershell"),
                 "local_board_path": str(peer.get("local_board_path") or ""),
                 "local_codex_home": str(peer.get("local_codex_home") or ""),
             }
@@ -1426,13 +1508,15 @@ def sync_state_once(args: argparse.Namespace) -> bool:
         target = peer["target"]
         remote_board_path = peer["remote_board_path"]
         remote_codex_home = peer["remote_codex_home"]
+        remote_shell = peer.get("remote_shell", "powershell")
         if not quiet:
             print(f"Syncing {target}", flush=True)
 
-        ok = run_external(["ssh", target, remote_mkdir_command(remote_board_path)], quiet=quiet) and ok
+        if direction in {"push", "both"}:
+            ok = run_external(["ssh", target, remote_mkdir_command(remote_board_path, remote_shell)], quiet=quiet) and ok
 
         if not getattr(args, "skip_remote_refresh", False):
-            remote_refresh = remote_refresh_command(limit, remote_board_path, remote_codex_home)
+            remote_refresh = remote_refresh_command(limit, remote_board_path, remote_codex_home, remote_shell)
             remote_ok, remote_error = run_external_result(["ssh", target, remote_refresh], quiet=quiet, timeout=20.0)
             ok = ok and remote_ok
             if remote_error and not quiet:
@@ -1444,13 +1528,17 @@ def sync_state_once(args: argparse.Namespace) -> bool:
                 target,
                 remote_board_path.rstrip("/\\") + "/machines",
                 machines_dir,
-                peer_json_names,
+                remote_shell,
+                quiet=quiet,
+                expected_names=peer_json_names,
             )
             pull_sessions, pull_sessions_error = pull_remote_json_folder(
                 target,
                 remote_board_path.rstrip("/\\") + "/sessions",
                 sessions_dir,
-                peer_json_names,
+                remote_shell,
+                quiet=quiet,
+                expected_names=peer_json_names,
             )
             ok = ok and pull_machines and pull_sessions
             if not quiet and not (pull_machines and pull_sessions):
@@ -1463,9 +1551,9 @@ def sync_state_once(args: argparse.Namespace) -> bool:
             machine_files = [str(path) for path in machines_dir.glob("*.json")]
             session_files = [str(path) for path in sessions_dir.glob("*.json")]
             if machine_files:
-                ok = run_external(["scp", "-q", *machine_files, f"{target}:{remote_board_path}/machines/"], quiet=True) and ok
+                ok = run_external(["scp", "-q", *machine_files, f"{target}:{remote_board_path}/machines/"], quiet=quiet) and ok
             if session_files:
-                ok = run_external(["scp", "-q", *session_files, f"{target}:{remote_board_path}/sessions/"], quiet=True) and ok
+                ok = run_external(["scp", "-q", *session_files, f"{target}:{remote_board_path}/sessions/"], quiet=quiet) and ok
 
     return ok
 
@@ -1483,13 +1571,18 @@ def read_json_files(folder: Path) -> list[dict[str, Any]]:
 
 
 def all_sessions() -> list[dict[str, Any]]:
-    assignments = load_assignments().get("sessions", {})
+    assignment_data = load_assignments()
+    assignments = assignment_data.get("sessions", {})
     launches = load_launches().get("sessions", {})
     active_by_machine = {
         str(payload.get("machine_id") or ""): {str(value).lower() for value in payload.get("active_session_ids", []) if value}
         for payload in read_json_files(MACHINES_DIR)
     }
     active_anywhere = set().union(*active_by_machine.values()) if active_by_machine else set()
+    pending_data = load_pending_launches()
+    pending_launches = [item for item in pending_data.get("launches", []) if isinstance(item, dict)]
+    pending_dirty = False
+    assignments_dirty = False
     hidden_ids = deleted_session_ids()
     sessions = []
     for payload in read_json_files(SESSIONS_DIR):
@@ -1499,7 +1592,20 @@ def all_sessions() -> list[dict[str, Any]]:
             session_active = session_key.lower() in active_anywhere
             if session_key and session_key in hidden_ids and not session_active:
                 continue
-            assigned = assignments.get(session_id) if session_id else None
+            assigned = assignments.get(session_key) if session_key else None
+            if not isinstance(assigned, dict) and session_key:
+                for pending in list(pending_launches):
+                    if pending_launch_matches(session, pending):
+                        assigned = {
+                            "project_id": slugify(str(pending.get("project_id") or "")),
+                            "subproject_id": str(pending.get("subproject_id") or "default"),
+                            "assigned_at": now_utc(),
+                        }
+                        assignments[session_key] = assigned
+                        pending_launches.remove(pending)
+                        pending_dirty = True
+                        assignments_dirty = True
+                        break
             if isinstance(assigned, dict):
                 session = dict(session)
                 session["project_id"] = assigned.get("project_id", session.get("project_id"))
@@ -1550,6 +1656,12 @@ def all_sessions() -> list[dict[str, Any]]:
             session.setdefault("generated_title", session_summary(session, 120))
             session.setdefault("generated_summary", session_summary(session, 180))
             sessions.append(session)
+    if assignments_dirty:
+        assignment_data["sessions"] = assignments
+        save_assignments(assignment_data)
+    if pending_dirty:
+        pending_data["launches"] = pending_launches
+        save_pending_launches(pending_data)
     sessions.sort(key=lambda row: int(row.get("updated_at") or 0), reverse=True)
     return sessions
 
@@ -1779,7 +1891,7 @@ def session_status(session: dict[str, Any], machines: dict[str, dict[str, Any]])
             return "remote-active" if session.get("machine_id") != machine_id() else "local-active"
         return "open"
     if session_id:
-        for _mid, payload in machines.items():
+        for mid, payload in machines.items():
             if not payload.get("fresh"):
                 continue
             payload_active_ids = {str(value).lower() for value in payload.get("active_session_ids", []) if value}
@@ -2010,6 +2122,9 @@ KEY_BINDINGS: list[tuple[str, str, str]] = [
     ("Filters", "x", "Clear filters"),
     ("Projects", "c", "Create a project and context file"),
     ("Projects", "p", "Assign selected session to current/project id"),
+    ("Assistant", "A", "Toggle conversational dashboard assistant pane"),
+    ("Bin", "B", "Open binned sessions"),
+    ("Bin", "r / D", "Restore or permanently remove selected bin item"),
     ("Actions", "r", "Refresh local session export"),
     ("Actions", "u", "Show local Codex usage stats"),
     ("Actions", ":new", "Open a new Codex session in a terminal"),
@@ -2017,7 +2132,7 @@ KEY_BINDINGS: list[tuple[str, str, str]] = [
     ("Actions", ":refresh", "Refresh local session export"),
     ("Actions", ":quit", "Quit dashboard"),
     ("Actions", "Enter", "Open selected session in a terminal"),
-    ("Actions", "d", "Hide selected broken session from dashboard"),
+    ("Actions", "d", "Move selected broken/stale session to bin"),
     ("Actions", "o", "Open/attach selected tmux or SSH session when metadata exists"),
     ("Actions", "?", "Show or hide this help"),
     ("Actions", "Esc", "Back: close help/search or clear active filters"),
@@ -2089,6 +2204,72 @@ def command_assign(args: argparse.Namespace) -> None:
     }
     save_assignments(data)
     print(f"Assigned {target['id']} to {project_id}/{args.subproject_id or 'default'}")
+
+
+def assign_session_id_to_project(session_id: str, project_id: str, subproject_id: str = "default", name: str = "") -> str:
+    project_id = slugify(project_id)
+    if not session_id or not project_id:
+        return ""
+    manifest = load_manifest()
+    if not any(str(project.get("id")) == project_id for project in manifest.get("projects", [])):
+        project_name = name or project_id
+        append_project_manifest(project_id, project_name)
+        ensure_project_context(project_id, project_name)
+    data = load_assignments()
+    data.setdefault("sessions", {})[session_id] = {
+        "project_id": project_id,
+        "subproject_id": subproject_id or "default",
+        "assigned_at": now_utc(),
+    }
+    save_assignments(data)
+    return project_id
+
+
+def comparable_cwd(value: str) -> str:
+    normalized = str(value or "").strip().replace("\\", "/").rstrip("/")
+    if re.match(r"^[A-Za-z]:/", normalized):
+        normalized = normalized.lower()
+    return normalized
+
+
+def pending_launch_matches(session: dict[str, Any], pending: dict[str, Any]) -> bool:
+    project_id = str(pending.get("project_id") or "").strip()
+    if not project_id:
+        return False
+    pending_cwd = comparable_cwd(str(pending.get("cwd") or ""))
+    session_cwd = comparable_cwd(str(session.get("cwd") or ""))
+    if pending_cwd and session_cwd and pending_cwd != session_cwd:
+        return False
+    pending_machine = str(pending.get("machine_id") or "").strip()
+    session_machine = str(session.get("machine_id") or "").strip()
+    if pending_machine and session_machine and pending_machine not in {session_machine, session_machine.split(".")[0]}:
+        return False
+    started_at = int(pending.get("started_at") or 0)
+    session_time = int(session.get("created_at") or session.get("updated_at") or 0)
+    return not started_at or session_time >= started_at - 60
+
+
+def add_pending_launch_assignment(cwd: str, project_id: str, subproject_id: str = "default", machine: str = "", project_name: str = "") -> None:
+    project_id = slugify(project_id)
+    if not project_id:
+        return
+    if project_name or not any(str(project.get("id")) == project_id for project in load_manifest().get("projects", [])):
+        append_project_manifest(project_id, project_name or project_id)
+        ensure_project_context(project_id, project_name or project_id)
+    data = load_pending_launches()
+    launches = data.setdefault("launches", [])
+    launches.append(
+        {
+            "cwd": cwd,
+            "machine_id": machine,
+            "project_id": project_id,
+            "project_name": project_name or project_id,
+            "subproject_id": subproject_id or "default",
+            "started_at": int(time.time()),
+            "created_at": now_utc(),
+        }
+    )
+    save_pending_launches(data)
 
 
 class DashboardApp:
@@ -2238,11 +2419,9 @@ class DashboardApp:
             self.stdscr.addnstr(y, start_x, text, max_width, attr)
         except curses.error:
             if y == height - 1 and start_x + max_width >= screen_width and max_width > 1:
-                try:
-                    self.stdscr.addnstr(y, start_x, text, max_width - 1, attr)
-                except curses.error:
-                    pass
-            return
+                self.stdscr.addnstr(y, start_x, text, max_width - 1, attr)
+                return
+            raise
 
     def draw_box(self, y: int, x: int, height: int, width: int, title: str = "") -> None:
         import curses
@@ -2511,6 +2690,30 @@ class AnsiDashboardApp:
         self.search_buffer = ""
         self.command_mode = False
         self.command_buffer = ""
+        self.chat_open = False
+        self.chat_active = False
+        self.chat_buffer = ""
+        self.chat_messages: list[tuple[str, str]] = [
+            (
+                "codex",
+                "I can monitor this dashboard and perform safe dashboard actions. Try: "
+                "status, refresh, hide stale, assign this to project NAME, create project NAME, new session.",
+            )
+        ]
+        self.selector_mode: str | None = None
+        self.selector_title = ""
+        self.selector_items: list[dict[str, str]] = []
+        self.selector_cursor = 0
+        self.selector_top = 0
+        self.new_project_id = ""
+        self.new_project_name = ""
+        self.new_remote_target = ""
+        self.new_folder_path = ""
+        self.new_folder_error = ""
+        self.folder_cache: dict[tuple[str, str], tuple[float, list[dict[str, str]], str]] = {}
+        self.folder_cache_lock = threading.Lock()
+        self.folder_prefetching: set[tuple[str, str]] = set()
+        self.folder_cache_ttl = 120.0
         self.should_quit = False
         self.input_mode: str | None = None
         self.input_buffer = ""
@@ -2636,7 +2839,7 @@ class AnsiDashboardApp:
                 )
             )
         elif self.sort_mode == "status":
-            rank = {"live": 0, "open": 1, "ready": 2, "stale": 3}
+            rank = {"live": 0, "ready": 1, "stale": 2}
             rows.sort(key=lambda row: (rank.get(session_lifecycle(row, self.machines), 9), session_location(row), -int(row.get("updated_at") or 0)))
         else:
             rows.sort(key=lambda row: int(row.get("updated_at") or 0), reverse=True)
@@ -2993,7 +3196,7 @@ class AnsiDashboardApp:
         self.message = f"Project: {label}"
 
     def cycle_status(self, delta: int) -> None:
-        statuses = ["all", "live", "open", "ready", "stale"]
+        statuses = ["all", "live", "ready", "stale"]
         index = statuses.index(self.status_filter) if self.status_filter in statuses else 0
         self.status_filter = statuses[(index + delta) % len(statuses)]
         self.cursor = 0
@@ -3150,6 +3353,10 @@ class AnsiDashboardApp:
         return icons[sum(ord(ch) for ch in project_id or label) % len(icons)]
 
     def status_bar(self, width: int) -> str:
+        if self.chat_active:
+            prompt = self.block(" assistant ", "24;31;44", "126;203;255")
+            value = self.chat_buffer or "ask: status | refresh | hide stale | assign this to project NAME | create project NAME"
+            return self.fit_ansi(prompt + self.color(" " + value, "38;2;238;241;245;48;2;24;31;44"), width)
         if self.input_mode:
             labels = {
                 "create_id": "new project id",
@@ -3186,9 +3393,9 @@ class AnsiDashboardApp:
         if width < 96:
             hints = self.block(" ? help  / find  Enter  q ", "238;241;245", "24;31;44", bold=False)
         elif width < 160:
-            hints = self.block(" ? h/l  /  o  Enter  q ", "238;241;245", "24;31;44", bold=False)
+            hints = self.block(" ? A B h/l  /  o  Enter  q ", "238;241;245", "24;31;44", bold=False)
         else:
-            hints = self.block(" ? help  h/l panels  j/k move  / search  c new  p assign  o attach  Enter resume  q quit ", "238;241;245", "24;31;44", bold=False)
+            hints = self.block(" ? help  A assistant  B bin  / search  c new  p assign  Enter resume  q quit ", "238;241;245", "24;31;44", bold=False)
         left = " ".join(segments)
         usage = self.usage_status_segments(width)
         message_width = 16 if width < 96 else 24 if width < 128 else 34
@@ -3314,6 +3521,7 @@ class AnsiDashboardApp:
             fields = [
                 ("󰌷 id", str(session.get("id"))),
                 ("󰄬 status", f"{session_location_icon(session)} {lifecycle}  {session.get('machine_id', '?')}  {format_ts(session.get('updated_at'))}"),
+                ("󰇅 machines", self.presence_summary(session, inner_width - 10)),
                 ("󰔟 activity", activity),
                 ("󰀄 account", account_label),
                 ("󰓅 tokens", f"{token_label}; last {compact_number(session.get('last_tokens')) or '0'}; in {compact_number(session.get('input_tokens')) or '0'} cached {compact_number(session.get('cached_input_tokens')) or '0'} out {compact_number(session.get('output_tokens')) or '0'} reason {compact_number(session.get('reasoning_output_tokens')) or '0'}"),
@@ -3344,12 +3552,75 @@ class AnsiDashboardApp:
         lines.append(self.pane_bottom(width, "details"))
         return lines[:height]
 
+    def render_chat_pane(self, height: int, width: int) -> list[str]:
+        inner_width = max(1, width - 4)
+        selected = self.current()
+        stale_count = sum(1 for session in self.sessions if session_lifecycle(session, self.machines) == "stale")
+        live_count = sum(1 for session in self.sessions if session_lifecycle(session, self.machines) == "live")
+        lines = [self.pane_top(width, "󰚩 Codex Chat", "details")]
+        lines.append(self.pane_row(self.color(f" {len(self.sessions)} sessions  {live_count} live  {stale_count} stale", "38;2;126;203;255;1"), width, pane="details"))
+        if selected:
+            project = f"{selected.get('project_id', 'uncategorized')}/{selected.get('subproject_id', 'default')}"
+            title = session_summary(selected, inner_width)
+            lines.extend(self.pane_wrapped_rows(self.color("󰈙 selected".ljust(11), "38;2;150;158;171"), f"{project} · {title}", width, pane="details"))
+        lines.extend(self.pane_wrapped_rows(self.color("󰯄 allowed".ljust(11), "38;2;150;158;171"), "refresh, hide stale, assign current session, create/select projects, open local/SSH sessions in a requested directory. No arbitrary shell.", width, pane="details"))
+        lines.append(self.pane_row("", width, pane="details"))
+        available = max(0, height - len(lines) - 3)
+        message_rows: list[str] = []
+        for role, message in self.chat_messages[-10:]:
+            label = "you" if role == "user" else "codex"
+            color = "38;2;92;214;144;1" if role == "user" else "38;2;126;203;255;1"
+            message_rows.extend(self.pane_wrapped_rows(self.color((label + ":").ljust(7), color), message, width, pane="details"))
+        lines.extend(message_rows[-available:])
+        lines.extend(self.pane_row("", width, pane="details") for _ in range(max(0, height - len(lines) - 2)))
+        prompt = ">" if self.chat_active else "A to talk"
+        lines.append(self.pane_row(self.color(f"{prompt} {self.chat_buffer}", "38;2;238;241;245;1"), width, pane="details"))
+        lines.append(self.pane_bottom(width, "details"))
+        return lines[:height]
+
     def render(self) -> str:
+        if self.selector_mode:
+            return self.render_selector()
         if self.show_help:
             return self.render_help()
         if self.show_usage:
             return self.render_usage_overlay()
         return self.render_dashboard()
+
+    def render_selector(self) -> str:
+        body_width, modal_height = self.modal_dimensions(preferred_width=74)
+        content_height = max(1, modal_height - 5)
+        max_top = max(0, len(self.selector_items) - content_height)
+        self.selector_top = min(max(self.selector_top, 0), max_top)
+        if self.selector_cursor < self.selector_top:
+            self.selector_top = self.selector_cursor
+        if self.selector_cursor >= self.selector_top + content_height:
+            self.selector_top = self.selector_cursor - content_height + 1
+        rows: list[str] = []
+        inner_width = max(1, body_width - 4)
+        for index, item in enumerate(self.selector_items[self.selector_top : self.selector_top + content_height]):
+            absolute = self.selector_top + index
+            icon = item.get("icon", " ")
+            label = item.get("label", "")
+            detail = item.get("detail", "")
+            detail_width = max(0, inner_width - 4 - min(42, max(18, inner_width // 2)))
+            label_width = max(12, inner_width - detail_width - 4)
+            content = f"{icon} {short_title(label, label_width):<{label_width}.{label_width}}"
+            if detail_width:
+                content += " " + short_title(detail, detail_width).rjust(detail_width)
+            if absolute == self.selector_cursor:
+                content = self.row_highlight(self.fit_ansi(content, inner_width), "36;64;78")
+            rows.append(self.pane_row(content, body_width, "38;2;126;203;255"))
+        rows.extend(self.pane_row("", body_width, "38;2;126;203;255") for _ in range(max(0, content_height - len(rows))))
+        hint = "Enter select  j/k move  Backspace up  n launch here  Esc cancel"
+        if self.selector_mode == "project":
+            hint = "Enter select  j/k move  + create project  Esc cancel"
+        elif self.selector_mode == "bin":
+            hint = "Enter/r restore  D permanently delete  j/k move  Esc close"
+        elif self.selector_mode == "folder" and self.new_folder_path == "__drives__":
+            hint = "Enter open drive  Backspace machines  j/k move  Esc cancel"
+        rendered, self.selector_top = self.render_centered_overlay(self.selector_title, rows, 0, hint)
+        return rendered
 
     def render_dashboard(self) -> str:
         height, width = self.term_size()
@@ -3359,7 +3630,9 @@ class AnsiDashboardApp:
         body_height = max(5, height - detail_height - 3)
         sidebar_width = 28 if width >= 96 else 0
         gap = 1 if sidebar_width else 0
-        list_width = width - sidebar_width - gap
+        chat_width = min(48, max(34, width // 3)) if self.chat_open and width >= 116 else 0
+        chat_gap = 1 if chat_width else 0
+        list_width = width - sidebar_width - gap - chat_width - chat_gap
         title = self.block("  ◈ Codex Dashboard  ", "238;241;245", "24;31;44")
         counts = self.chip(f" 󰈙 {len(self.visible)}/{len(self.sessions)} ", "24;31;44", "126;203;255")
         machine = self.chip(f"  {machine_id()} ", "24;31;44", "92;214;144")
@@ -3376,12 +3649,16 @@ class AnsiDashboardApp:
         rows: list[str] = ["\x1b[?25l\x1b[H" + self.fit_ansi(header, width)]
 
         list_lines = self.render_session_list(body_height, list_width)
+        chat_lines = self.render_chat_pane(body_height, chat_width) if chat_width else []
         if sidebar_width:
             sidebar_lines = self.render_sidebar(body_height, sidebar_width)
-            for left, right in zip(sidebar_lines, list_lines):
-                rows.append(left + " " + right)
+            for index, (left, right) in enumerate(zip(sidebar_lines, list_lines)):
+                chat = (" " + chat_lines[index]) if chat_lines else ""
+                rows.append(left + " " + right + chat)
         else:
-            rows.extend(list_lines)
+            for index, line in enumerate(list_lines):
+                chat = (" " + chat_lines[index]) if chat_lines else ""
+                rows.append(line + chat)
 
         rows.extend(self.render_detail(detail_height, width))
         rows.append(self.status_bar(width))
@@ -3738,12 +4015,32 @@ class AnsiDashboardApp:
             self.show_help = True
             self.help_top = 0
             return
+        if command in ("bin", "trash"):
+            self.open_bin_selector()
+            return
+        if command in ("chat", "assistant", "a"):
+            self.toggle_chat()
+            return
         if not command:
             self.message = "Command cancelled"
             return
         self.message = f"Unknown command: {command}"
 
     def go_back(self) -> None:
+        if self.selector_mode:
+            self.selector_mode = None
+            self.selector_items = []
+            self.message = "New session cancelled"
+            return
+        if self.chat_active:
+            self.chat_active = False
+            self.chat_buffer = ""
+            self.message = "Assistant input closed"
+            return
+        if self.chat_open:
+            self.chat_open = False
+            self.message = "Assistant closed"
+            return
         if self.show_help:
             self.show_help = False
             self.message = "Help closed"
@@ -3821,10 +4118,396 @@ class AnsiDashboardApp:
         self.attach_id = str(session["id"])
 
     def open_new_session(self) -> None:
-        session = self.current()
-        cwd = str(session.get("cwd") or "") if session else ""
-        ok, message = open_new_session_terminal(cwd or None)
+        self.start_new_session_flow()
+
+    def start_new_session_flow(self) -> None:
+        self.selector_mode = "project"
+        self.selector_title = "New Session: Select Project"
+        self.selector_cursor = 0
+        self.selector_top = 0
+        self.new_project_id = ""
+        self.new_project_name = ""
+        self.new_remote_target = ""
+        self.new_folder_path = ""
+        self.new_folder_error = ""
+        items = [{"kind": "create_project", "icon": "+", "label": "Create new project", "detail": "type a name"}]
+        for project in load_manifest().get("projects", []):
+            project_id = str(project.get("id") or "").strip()
+            if not project_id:
+                continue
+            name = str(project.get("name") or project_id)
+            items.append({"kind": "project", "icon": self.project_icon(project_id, name), "label": name, "detail": project_id, "project_id": project_id, "project_name": name})
+        self.selector_items = items
+        self.message = "Select project for new session"
+
+    def machine_selector_items(self) -> list[dict[str, str]]:
+        items = [{"kind": "machine", "icon": "󰀵", "label": machine_id(), "detail": "local", "target": "", "path": str(Path.home())}]
+        seen = {machine_id(), machine_id().split(".")[0], ""}
+        for peer in load_peers().get("peers", []):
+            if not isinstance(peer, dict):
+                continue
+            target = str(peer.get("target") or "").strip()
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            label = target.split("@")[-1]
+            start_path = "__drives__" if remote_shell_for_target(target) == "powershell" else "~"
+            items.append({"kind": "machine", "icon": "󰇅", "label": label, "detail": target, "target": target, "path": start_path})
+        return items
+
+    def open_machine_selector(self) -> None:
+        self.selector_mode = "machine"
+        self.selector_title = "New Session: Select Machine"
+        self.selector_items = self.machine_selector_items()
+        self.selector_cursor = 0
+        self.selector_top = 0
+        self.message = "Select machine for new session"
+
+    def create_project_from_selector(self) -> None:
+        self.selector_mode = None
+        self.input_mode = "new_project_name"
+        self.input_buffer = ""
+        self.input_data = {}
+        self.message = "New project name"
+
+    def local_folder_items(self, path_value: str) -> list[dict[str, str]]:
+        path = Path(path_value).expanduser()
+        try:
+            path = path.resolve()
+            children = sorted([child for child in path.iterdir() if child.is_dir() and not child.name.startswith(".")], key=lambda item: item.name.lower())
+            self.new_folder_error = ""
+        except Exception as exc:
+            children = []
+            self.new_folder_error = str(exc)
+        items = [
+            {"kind": "folder_here", "icon": "󰉋", "label": "Use this folder", "detail": str(path), "path": str(path)},
+            {"kind": "folder_parent", "icon": "󰁞", "label": "..", "detail": str(path.parent), "path": str(path.parent)},
+        ]
+        items.extend({"kind": "folder", "icon": "󰉋", "label": child.name, "detail": str(child), "path": str(child)} for child in children[:200])
+        return items
+
+    def remote_folder_items(self, target: str, path_value: str, use_cache: bool = True, update_error: bool = True) -> list[dict[str, str]]:
+        remote_shell = remote_shell_for_target(target)
+        browse_path = path_value
+        cache_key = (target, browse_path)
+        if use_cache:
+            with self.folder_cache_lock:
+                cached = self.folder_cache.get(cache_key)
+            if cached and time.time() - cached[0] < self.folder_cache_ttl:
+                if update_error:
+                    self.new_folder_error = cached[2]
+                return [dict(item) for item in cached[1]]
+        if remote_shell == "powershell":
+            if browse_path == "__drives__":
+                ps_script = (
+                    "$ErrorActionPreference='Stop'; "
+                    "$drives=Get-PSDrive -PSProvider FileSystem | Sort-Object Name; "
+                    "$payload=[ordered]@{ path='__drives__'; parent='__drives__'; drives=@($drives | ForEach-Object { [ordered]@{ name=($_.Name + ':'); path=($_.Name + ':\\') } }); dirs=@() }; "
+                    "$payload | ConvertTo-Json -Depth 5 -Compress"
+                )
+            else:
+                ps_script = (
+                    "$ErrorActionPreference='Stop'; "
+                    f"$p=(Resolve-Path -LiteralPath {ps_single_quote(browse_path)}).Path; "
+                    "$parent=(Split-Path -Parent $p); if (-not $parent) { $parent='__drives__' }; "
+                    "$dirs=Get-ChildItem -Directory -LiteralPath $p -Force:$false | Where-Object { -not $_.Name.StartsWith('.') } | Sort-Object Name | Select-Object -First 200 Name,FullName; "
+                    "$payload=[ordered]@{ path=$p; parent=$parent; dirs=@($dirs | ForEach-Object { [ordered]@{ name=$_.Name; path=$_.FullName } }) }; "
+                    "$payload | ConvertTo-Json -Depth 5 -Compress"
+                )
+            remote_invocation = f"powershell -NoProfile -Command {windows_remote_double_quote(ps_script)}"
+        else:
+            script_body = (
+                "import json, os, pathlib, sys\n"
+                "p=pathlib.Path(os.path.expanduser(sys.argv[1])).resolve()\n"
+                "try:\n"
+                " rows=sorted([x for x in p.iterdir() if x.is_dir() and not x.name.startswith('.')], key=lambda x:x.name.lower())[:200]\n"
+                " print(json.dumps({'path':str(p),'parent':str(p.parent),'dirs':[{'name':x.name,'path':str(x)} for x in rows]}))\n"
+                "except Exception as e:\n"
+                " print(json.dumps({'path':str(p),'parent':str(p.parent),'dirs':[],'error':str(e)}))\n"
+            )
+            remote_invocation = f"python3 -c {posix_shell_quote(script_body)} {posix_shell_quote(browse_path)}"
+        try:
+            result = subprocess.run(["ssh", target, remote_invocation], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=8)
+            payload = json.loads((result.stdout or "{}").splitlines()[-1] if result.stdout else "{}")
+            if result.returncode != 0 and not payload:
+                raise RuntimeError((result.stderr or "remote folder listing failed").strip())
+            error = str(payload.get("error") or "")
+        except Exception as exc:
+            payload = {"path": browse_path, "parent": browse_path, "dirs": []}
+            error = str(exc)
+        if update_error:
+            self.new_folder_error = error
+        current = str(payload.get("path") or browse_path)
+        parent = str(payload.get("parent") or current)
+        if remote_shell == "powershell" and current == "__drives__":
+            items = [{"kind": "folder_parent", "icon": "󰁞", "label": "Back to machines", "detail": "", "path": "__machines__"}]
+            for drive in payload.get("drives") or []:
+                if isinstance(drive, dict):
+                    items.append({"kind": "folder", "icon": "", "label": str(drive.get("name") or ""), "detail": str(drive.get("path") or ""), "path": str(drive.get("path") or "")})
+            with self.folder_cache_lock:
+                self.folder_cache[cache_key] = (time.time(), [dict(item) for item in items], error)
+            return items
+        items = [
+            {"kind": "folder_here", "icon": "󰉋", "label": "Use this folder", "detail": f"{target}:{current}", "path": current},
+            {"kind": "folder_parent", "icon": "󰁞", "label": "Drives" if parent == "__drives__" else "..", "detail": parent if parent != "__drives__" else "select drive", "path": parent},
+        ]
+        for child in payload.get("dirs") or []:
+            if isinstance(child, dict):
+                items.append({"kind": "folder", "icon": "󰉋", "label": str(child.get("name") or ""), "detail": str(child.get("path") or ""), "path": str(child.get("path") or "")})
+        with self.folder_cache_lock:
+            self.folder_cache[cache_key] = (time.time(), [dict(item) for item in items], error)
+        return items
+
+    def open_folder_selector(self, target: str, path_value: str) -> None:
+        self.new_remote_target = target
+        self.new_folder_path = path_value
+        self.selector_mode = "folder"
+        machine_label = target or machine_id()
+        self.selector_title = f"New Session: Drives on {machine_label}" if path_value == "__drives__" else f"New Session: Folder on {machine_label}"
+        self.selector_cursor = 0
+        self.selector_top = 0
+        self.selector_items = self.remote_folder_items(target, path_value) if target else self.local_folder_items(path_value)
+        if self.new_folder_error:
+            self.message = f"Folder listing: {short_title(self.new_folder_error, 80)}"
+        elif target:
+            self.message = f"Folder loaded: {machine_label}"
+        if target:
+            self.start_folder_prefetch(target, self.selector_items)
+
+    def start_folder_prefetch(self, target: str, items: list[dict[str, str]]) -> None:
+        paths = [str(item.get("path") or "") for item in items if item.get("kind") == "folder"][:3]
+        for path_value in paths:
+            if not path_value or path_value == "__machines__":
+                continue
+            cache_key = (target, path_value)
+            with self.folder_cache_lock:
+                cached = self.folder_cache.get(cache_key)
+                if cached and time.time() - cached[0] < self.folder_cache_ttl:
+                    continue
+                if cache_key in self.folder_prefetching:
+                    continue
+                self.folder_prefetching.add(cache_key)
+
+            def worker(target_value: str = target, folder_value: str = path_value, key: tuple[str, str] = cache_key) -> None:
+                try:
+                    self.remote_folder_items(target_value, folder_value, use_cache=True, update_error=False)
+                finally:
+                    with self.folder_cache_lock:
+                        self.folder_prefetching.discard(key)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+    def launch_selected_new_session(self, path_value: str) -> None:
+        ok, message = open_new_session_terminal(path_value, self.new_project_id, self.new_project_name, "default", self.new_remote_target)
+        self.selector_mode = None
+        if ok:
+            self.reload(quiet=True)
         self.message = message if ok else f"Open failed: {message}"
+
+    def open_bin_selector(self) -> None:
+        self.selector_mode = "bin"
+        self.selector_title = "Codex Dashboard Bin"
+        self.selector_cursor = 0
+        self.selector_top = 0
+        items: list[dict[str, str]] = []
+        for session_id, record in bin_rows():
+            snapshot = record.get("snapshot") if isinstance(record.get("snapshot"), dict) else {}
+            title = str(snapshot.get("generated_title") or snapshot.get("summary") or session_id)
+            project = f"{snapshot.get('project_id', '')}/{snapshot.get('subproject_id', '')}".strip("/")
+            machine = str(snapshot.get("machine_id") or "")
+            items.append(
+                {
+                    "kind": "bin_session",
+                    "icon": "󰩹",
+                    "label": short_title(title, 64),
+                    "detail": f"{machine} {project}".strip(),
+                    "session_id": session_id,
+                }
+            )
+        if not items:
+            items.append({"kind": "bin_empty", "icon": "󰩹", "label": "Bin is empty", "detail": ""})
+        self.selector_items = items
+        self.message = "Bin: Enter/r restore, D permanently delete"
+
+    def restore_selected_bin_item(self) -> None:
+        item = self.selector_items[self.selector_cursor] if self.selector_items else {}
+        session_id = str(item.get("session_id") or "")
+        if not session_id:
+            self.message = "No bin item selected"
+            return
+        if restore_deleted_session(session_id):
+            refresh_export_quiet(int(getattr(self.args, "limit", 500) or 500))
+            self.reload(quiet=True)
+            self.open_bin_selector()
+            self.message = f"Restored {short_title(session_id, 18)}"
+        else:
+            self.message = "Bin item not found"
+
+    def permanently_delete_selected_bin_item(self) -> None:
+        item = self.selector_items[self.selector_cursor] if self.selector_items else {}
+        session_id = str(item.get("session_id") or "")
+        if not session_id:
+            self.message = "No bin item selected"
+            return
+        if permanently_delete_bin_session(session_id):
+            self.open_bin_selector()
+            self.message = f"Permanently deleted {short_title(session_id, 18)} from bin"
+        else:
+            self.message = "Bin item not found"
+
+    def toggle_chat(self) -> None:
+        self.chat_open = not self.chat_open
+        self.chat_active = self.chat_open
+        self.chat_buffer = ""
+        self.message = "Assistant opened" if self.chat_open else "Assistant closed"
+
+    def chat_reply(self, message: str) -> None:
+        self.chat_messages.append(("codex", message))
+        self.message = short_title(message, 90)
+
+    def create_or_select_project(self, name: str) -> str:
+        project_id = slugify(name)
+        if not project_id:
+            return ""
+        manifest = load_manifest()
+        if not any(str(project.get("id")) == project_id for project in manifest.get("projects", [])):
+            append_project_manifest(project_id, name.strip() or project_id)
+            ensure_project_context(project_id, name.strip() or project_id)
+        self.reload(quiet=True)
+        self.project_filter = project_id
+        self.cursor = 0
+        self.top = 0
+        self.apply_filter()
+        return project_id
+
+    def assign_session_to_project(self, session: dict[str, Any], project_name: str) -> str:
+        project_id = self.create_or_select_project(project_name)
+        if not project_id:
+            return ""
+        data = load_assignments()
+        data.setdefault("sessions", {})[str(session["id"])] = {
+            "project_id": project_id,
+            "subproject_id": session.get("subproject_id") or "default",
+            "assigned_at": now_utc(),
+        }
+        save_assignments(data)
+        self.reload(quiet=True)
+        self.project_filter = project_id
+        self.apply_filter()
+        return project_id
+
+    def handle_chat_request(self, text: str) -> None:
+        request = " ".join(text.strip().split())
+        lowered = request.lower()
+        self.chat_messages.append(("user", request))
+        if not request:
+            self.chat_reply("Tell me what to change. I can act on dashboard state directly.")
+            return
+        if lowered in {"help", "?", "what can you do"}:
+            self.chat_reply("I can run safe dashboard actions: status, refresh, hide stale, assign this to project NAME, create/select project NAME, open selected, or new session in DIR project NAME. Remote forms: arkay:/path or on arkay in /path.")
+            return
+        if "status" in lowered or "summary" in lowered or "monitor" in lowered:
+            stale_count = sum(1 for session in self.sessions if session_lifecycle(session, self.machines) == "stale")
+            live_count = sum(1 for session in self.sessions if session_lifecycle(session, self.machines) == "live")
+            selected = self.current()
+            selected_text = f" Selected: {session_summary(selected, 50)}." if selected else ""
+            self.chat_reply(f"I see {len(self.sessions)} sessions: {live_count} live and {stale_count} stale.{selected_text}")
+            return
+        if "refresh" in lowered or "reload" in lowered or "sync" in lowered:
+            self.start_background_refresh(force=True)
+            self.chat_reply("Started a background dashboard refresh. I will update the pane when cached session state changes.")
+            return
+        if ("hide" in lowered or "delete" in lowered or "remove" in lowered or "clean" in lowered) and "stale" in lowered:
+            stale_sessions = [session for session in self.sessions if session_lifecycle(session, self.machines) == "stale"]
+            removed = 0
+            for session in stale_sessions:
+                session_id = str(session.get("id") or "")
+                if session_id:
+                    removed += soft_delete_session(session_id, "stale session swept to bin via assistant", session)
+            self.reload(quiet=True)
+            self.chat_reply(f"Hidden {len(stale_sessions)} stale session(s); updated {removed} dashboard row(s).")
+            return
+        project_match = re.search(r"(?:assign|move|send).*(?:to|into)\s+(?:project\s+)?(.+)$", request, flags=re.IGNORECASE)
+        if project_match:
+            session = self.current()
+            if not session:
+                self.chat_reply("No selected session to assign. Select one first, then ask again.")
+                return
+            project_id = self.assign_session_to_project(session, project_match.group(1).strip())
+            self.chat_reply(f"Assigned the selected session to project {project_id}.")
+            return
+        create_match = re.search(r"(?:create|open|select|new)\s+project\s+(.+)$", request, flags=re.IGNORECASE)
+        if create_match:
+            project_id = self.create_or_select_project(create_match.group(1).strip())
+            self.chat_reply(f"Project {project_id} is selected and ready.")
+            return
+        if "new session" in lowered or "open a session" in lowered or "start codex" in lowered or "start a session" in lowered:
+            cwd, project_id, project_name, remote_target = self.parse_chat_launch_request(request)
+            ok, message = open_new_session_terminal(cwd or None, project_id, project_name, "default", remote_target)
+            if ok:
+                self.reload(quiet=True)
+            self.chat_reply(message if ok else f"Open failed: {message}")
+            return
+        if "open selected" in lowered or "resume selected" in lowered or "open this" in lowered:
+            session = self.current()
+            if not session:
+                self.chat_reply("No selected session to open.")
+                return
+            ok, message = open_session_terminal(session)
+            self.chat_reply(message if ok else f"Open failed: {message}")
+            return
+        self.chat_reply("I did not map that to a safe action. Try: assign this to project NAME, create project NAME, hide stale, refresh, or new session.")
+
+    def parse_chat_launch_request(self, request: str) -> tuple[str, str, str, str]:
+        selected = self.current()
+        fallback_cwd = str(selected.get("cwd") or "") if selected else ""
+        project_name = ""
+        project_id = ""
+        remote_target = ""
+        searchable = request.strip()
+
+        before_project = searchable
+        project_match = re.search(r"assign(?:\s+(?:it|this))?\s+to\s+project\s+(.+)$", searchable, flags=re.IGNORECASE)
+        if not project_match:
+            project_match = re.search(r"\bproject\s+(.+)$", searchable, flags=re.IGNORECASE)
+        if project_match:
+            project_name = project_match.group(1).strip(" .")
+            project_id = slugify(project_name)
+            before_project = searchable[: project_match.start()].strip()
+
+        remote_match = re.search(r"(?:\bon\b|ssh(?:\s+(?:to|into))?|remote)\s+([A-Za-z0-9_.@-]+)", before_project, flags=re.IGNORECASE)
+        if remote_match:
+            remote_target = remote_match.group(1).strip()
+
+        cwd = ""
+        cwd_match = re.search(r"(?:\bin\b|\bat\b|directory|dir|cwd|cd\s+to)\s+(.+)$", before_project, flags=re.IGNORECASE)
+        if cwd_match:
+            cwd = cwd_match.group(1).strip(" .")
+        colon_match = re.match(r"^([A-Za-z0-9_.@-]+):(.+)$", cwd)
+        if colon_match and not re.match(r"^[A-Za-z]:", cwd):
+            remote_target = colon_match.group(1)
+            cwd = colon_match.group(2).strip()
+        if remote_target and cwd.lower().startswith(remote_target.lower() + " "):
+            cwd = cwd[len(remote_target) :].strip()
+        if not cwd:
+            cwd = "~" if remote_target else fallback_cwd or str(Path.home())
+        return cwd, project_id, project_name, remote_target
+
+    def handle_chat_key(self, key: str) -> bool:
+        if not self.chat_active:
+            return False
+        if key == "\x1b":
+            self.chat_active = False
+            self.chat_buffer = ""
+        elif key in ("\r", "\n"):
+            text = self.chat_buffer
+            self.chat_buffer = ""
+            self.handle_chat_request(text)
+        elif key in ("\b", "\x7f"):
+            self.chat_buffer = self.chat_buffer[:-1]
+        elif len(key) == 1 and key >= " ":
+            self.chat_buffer += key
+        return True
 
     def delete_current_session(self) -> None:
         session = self.current()
@@ -3835,7 +4518,7 @@ class AnsiDashboardApp:
         if not session_id:
             self.message = "Selected session has no id"
             return
-        removed = soft_delete_session(session_id, "hidden from dashboard via TUI")
+        removed = soft_delete_session(session_id, "hidden from dashboard via TUI", session)
         self.reload(quiet=True)
         self.cursor = min(self.cursor, max(0, len(self.visible) - 1))
         self.message = f"Hidden session {short_title(session_id, 18)} ({removed} row(s))"
@@ -3874,6 +4557,20 @@ class AnsiDashboardApp:
     def accept_input(self) -> None:
         value = self.input_buffer.strip()
         mode = self.input_mode
+        if mode == "new_project_name":
+            if not value:
+                self.cancel_input()
+                return
+            project_id = slugify(value)
+            self.new_project_id = project_id
+            self.new_project_name = value
+            append_project_manifest(project_id, value)
+            ensure_project_context(project_id, value)
+            self.input_mode = None
+            self.input_buffer = ""
+            self.reload(quiet=True)
+            self.open_machine_selector()
+            return
         if mode == "create_id":
             if not value:
                 self.cancel_input()
@@ -3923,6 +4620,74 @@ class AnsiDashboardApp:
             self.input_buffer = self.input_buffer[:-1]
         elif len(key) == 1 and key >= " ":
             self.input_buffer += key
+        return True
+
+    def handle_selector_key(self, key: str) -> bool:
+        if not self.selector_mode:
+            return False
+        if key == "\x1b":
+            self.selector_mode = None
+            self.selector_items = []
+            self.message = "New session cancelled"
+            return True
+        if key in ("j", "down"):
+            self.selector_cursor = min(self.selector_cursor + 1, max(0, len(self.selector_items) - 1))
+            return True
+        if key in ("k", "up"):
+            self.selector_cursor = max(0, self.selector_cursor - 1)
+            return True
+        if key in ("pagedown", "\x06"):
+            self.selector_cursor = min(self.selector_cursor + 8, max(0, len(self.selector_items) - 1))
+            return True
+        if key in ("pageup", "\x02"):
+            self.selector_cursor = max(0, self.selector_cursor - 8)
+            return True
+        if self.selector_mode == "project" and key == "+":
+            self.create_project_from_selector()
+            return True
+        if self.selector_mode == "folder" and key in ("n", " "):
+            self.launch_selected_new_session(self.new_folder_path)
+            return True
+        if self.selector_mode == "folder" and key in ("\b", "\x7f", "h", "left"):
+            parent = self.selector_items[1].get("path", self.new_folder_path) if len(self.selector_items) > 1 else self.new_folder_path
+            if parent == "__machines__" or (self.new_folder_path == "__drives__" and self.new_remote_target):
+                self.open_machine_selector()
+            else:
+                self.open_folder_selector(self.new_remote_target, parent)
+            return True
+        if self.selector_mode == "bin" and key in ("r", "R"):
+            self.restore_selected_bin_item()
+            return True
+        if self.selector_mode == "bin" and key == "D":
+            self.permanently_delete_selected_bin_item()
+            return True
+        if key not in ("\r", "\n"):
+            return True
+        item = self.selector_items[self.selector_cursor] if self.selector_items else {}
+        kind = item.get("kind", "")
+        if self.selector_mode == "bin":
+            self.restore_selected_bin_item()
+            return True
+        if self.selector_mode == "project":
+            if kind == "create_project":
+                self.create_project_from_selector()
+                return True
+            self.new_project_id = str(item.get("project_id") or "")
+            self.new_project_name = str(item.get("project_name") or self.new_project_id)
+            self.open_machine_selector()
+            return True
+        if self.selector_mode == "machine":
+            self.open_folder_selector(str(item.get("target") or ""), str(item.get("path") or "~"))
+            return True
+        if self.selector_mode == "folder":
+            if kind == "folder_here":
+                self.launch_selected_new_session(str(item.get("path") or self.new_folder_path))
+                return True
+            if kind == "folder_parent" and str(item.get("path") or "") == "__machines__":
+                self.open_machine_selector()
+                return True
+            self.open_folder_selector(self.new_remote_target, str(item.get("path") or self.new_folder_path))
+            return True
         return True
 
     def cycle_search(self, delta: int) -> None:
@@ -3997,7 +4762,7 @@ class AnsiDashboardApp:
         if win_key:
             return win_key
         if platform.system().lower() != "windows":
-            return self.read_posix_key(timeout)
+            return self.read_posix_terminal_input(timeout)
         import msvcrt
 
         deadline = time.time() + timeout
@@ -4047,24 +4812,32 @@ class AnsiDashboardApp:
         return key
 
     @staticmethod
-    def read_posix_key(timeout: float = 1.0) -> str:
-        import select
+    def read_posix_terminal_input(timeout: float = 1.0) -> str:
+        try:
+            import select
+        except Exception:
+            time.sleep(timeout)
+            return "tick"
 
-        fd = sys.stdin.fileno()
-        readable, _, _ = select.select([fd], [], [], timeout)
+        readable, _, _ = select.select([sys.stdin], [], [], timeout)
         if not readable:
             return "tick"
-        key = os.read(fd, 1).decode("utf-8", "replace")
+        key = sys.stdin.read(1)
         if key != "\x1b":
             return key
+
         seq = ""
         deadline = time.time() + 0.05
         while time.time() < deadline:
-            readable, _, _ = select.select([fd], [], [], max(0.0, deadline - time.time()))
-            if not readable:
+            remaining = max(0.0, deadline - time.time())
+            ready, _, _ = select.select([sys.stdin], [], [], remaining)
+            if not ready:
                 break
-            seq += os.read(fd, 1).decode("utf-8", "replace")
-            deadline = time.time() + 0.01
+            seq += sys.stdin.read(1)
+            if seq.startswith("[<") and seq.endswith(("m", "M")):
+                break
+            if seq in {"[A", "OA", "[B", "OB", "[D", "OD", "[C", "OC", "[5~", "[6~", "[Z"}:
+                break
         if seq.startswith("[<"):
             match = re.match(r"\[<(\d+);(\d+);(\d+)([mM])", seq)
             if match:
@@ -4082,6 +4855,8 @@ class AnsiDashboardApp:
             return "pageup"
         if seq in ("[6~",):
             return "pagedown"
+        if seq == "[Z":
+            return "\x1b[Z"
         return "\x1b" if not seq else "\x1b" + seq
 
     @staticmethod
@@ -4201,26 +4976,29 @@ class AnsiDashboardApp:
             pass
 
     @staticmethod
-    def enable_posix_terminal_input() -> list[Any] | None:
+    def enable_posix_terminal_input() -> Any:
         if platform.system().lower() == "windows" or not sys.stdin.isatty():
             return None
         try:
             import termios
-            import tty
-            fd = sys.stdin.fileno()
-            original = termios.tcgetattr(fd)
-            tty.setcbreak(fd)
-            return original
         except Exception:
             return None
+        fd = sys.stdin.fileno()
+        original = termios.tcgetattr(fd)
+        raw = original[:]
+        raw[3] &= ~(termios.ICANON | termios.ECHO)
+        raw[6][termios.VMIN] = 0
+        raw[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSADRAIN, raw)
+        return original
 
     @staticmethod
-    def restore_posix_terminal_input(attrs: list[Any] | None) -> None:
-        if attrs is None or platform.system().lower() == "windows" or not sys.stdin.isatty():
+    def restore_posix_terminal_input(mode: Any) -> None:
+        if mode is None or platform.system().lower() == "windows":
             return
         try:
             import termios
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attrs)
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, mode)
         except Exception:
             pass
 
@@ -4231,7 +5009,7 @@ class AnsiDashboardApp:
         self.start_background_refresh(force=True)
         pending_g = False
         original_input_mode = self.enable_windows_console_input()
-        original_posix_input_mode = self.enable_posix_terminal_input()
+        original_posix_mode = self.enable_posix_terminal_input()
         print("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H", end="")
         try:
             while True:
@@ -4243,18 +5021,22 @@ class AnsiDashboardApp:
                 key = self.read_key(timeout=0.2)
                 if key == "tick":
                     self.spinner_index = (self.spinner_index + 1) % len(SPINNER_FRAMES)
-                    if not self.search_mode and not self.command_mode and not self.input_mode and not self.show_help and not self.show_usage:
+                    if not self.search_mode and not self.command_mode and not self.input_mode and not self.chat_active and not self.show_help and not self.show_usage:
                         self.reload_if_board_changed()
                         self.auto_refresh()
                     continue
                 if key.startswith("mouse:"):
                     _, button, x, y, released = key.split(":")
-                    if self.show_help or self.show_usage:
+                    if self.selector_mode or self.show_help or self.show_usage:
                         self.go_back()
                         continue
                     self.handle_mouse(int(x), int(y), int(button), released == "True")
                     continue
+                if self.handle_selector_key(key):
+                    continue
                 if self.handle_input_key(key):
+                    continue
+                if self.handle_chat_key(key):
                     continue
                 if self.search_mode:
                     if key in ("\x1b",):
@@ -4338,6 +5120,12 @@ class AnsiDashboardApp:
                     continue
                 if key == "u":
                     self.open_usage_overlay()
+                    continue
+                if key == "A":
+                    self.toggle_chat()
+                    continue
+                if key == "B":
+                    self.open_bin_selector()
                     continue
                 if key in ("j", "down"):
                     self.vertical_move(1)
@@ -4424,7 +5212,7 @@ class AnsiDashboardApp:
         finally:
             print("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h", end="", flush=True)
             self.restore_windows_console_input(original_input_mode)
-            self.restore_posix_terminal_input(original_posix_input_mode)
+            self.restore_posix_terminal_input(original_posix_mode)
 
 
 def run_ansi_dashboard(args: argparse.Namespace) -> None:
@@ -4444,15 +5232,16 @@ def command_dashboard(args: argparse.Namespace) -> None:
         args.per_group = args.per_group or 20
         command_list(args)
         return
-    if os.environ.get("CODEX_DASH_UI", "ansi").strip().lower() != "curses":
+    try:
         run_ansi_dashboard(args)
         return
+    except Exception as exc:
+        if getattr(args, "tui", False):
+            raise
+        print(f"ANSI terminal UI is unavailable, trying curses: {exc}", file=sys.stderr)
     try:
         import curses
     except ImportError as exc:
-        if platform.system().lower() == "windows":
-            run_ansi_dashboard(args)
-            return
         print(f"Terminal UI is unavailable: {exc}")
         command_list(args)
         return
@@ -4502,6 +5291,62 @@ def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def posix_shell_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def windows_remote_double_quote(value: str) -> str:
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def tmux_session_name(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
+    name = name.strip("-._")
+    return short_title(name or "codex", 48)
+
+
+def remote_shell_for_target(target: str) -> str:
+    target = str(target or "").strip()
+    target_host = target.split("@")[-1].lower()
+    for peer in load_peers().get("peers", []):
+        if not isinstance(peer, dict):
+            continue
+        peer_target = str(peer.get("target") or "").strip()
+        peer_host = peer_target.split("@")[-1].lower()
+        if target in {peer_target, peer_host} or target_host in {peer_target.lower(), peer_host}:
+            return str(peer.get("remote_shell") or "powershell")
+    return "powershell" if target_host in {"arkay"} else "sh"
+
+
+def wsl_path_for_remote(path_value: str) -> str:
+    path_value = str(path_value or "").strip()
+    match = re.match(r"^([A-Za-z]):[\\/](.*)$", path_value)
+    if not match:
+        return path_value
+    drive, rest = match.groups()
+    rest = rest.replace("\\", "/")
+    return f"/mnt/{drive.lower()}/{rest}"
+
+
+def remote_mux_codex_command(workdir: str, project_id: str = "", remote_shell: str = "sh") -> tuple[str, str]:
+    session_seed = project_id or Path(workdir.replace("\\", "/").rstrip("/")).name or "codex"
+    session_name = "codex-" + tmux_session_name(session_seed)
+    if remote_shell == "powershell":
+        command = f"Set-Location -LiteralPath {ps_single_quote(workdir)}; codex"
+        remote_command = f"psmux new -s {session_name} -- powershell -NoExit -Command {windows_remote_double_quote(command)}"
+        return remote_command, session_name
+    remote_inner = f"cd {posix_shell_quote(workdir)} && codex"
+    remote_command = (
+        "command -v tmux >/dev/null 2>&1 || { echo 'tmux is required on the remote host'; exit 127; }; "
+        f"tmux new-session -A -s {posix_shell_quote(session_name)} {posix_shell_quote(remote_inner)}"
+    )
+    return remote_command, session_name
+
+
+def remote_tmux_codex_command(workdir: str, project_id: str = "") -> tuple[str, str]:
+    return remote_mux_codex_command(workdir, project_id, "sh")
+
+
 def session_ssh_target(session: dict[str, Any]) -> str:
     machine = str(session.get("machine_id") or "").strip()
     if machine and machine != machine_id():
@@ -4522,8 +5367,28 @@ def resume_command_for_session(session: dict[str, Any]) -> str:
     return f"codex resume --cd {shell_quote(cwd)} {shell_quote(session_id)}"
 
 
+def wezterm_executable() -> str | None:
+    found = shutil.which("wezterm") if "shutil" in globals() else None
+    if found:
+        return found
+    if platform.system().lower() == "darwin":
+        for path in (
+            Path("/Applications/WezTerm.app/Contents/MacOS/wezterm"),
+            Path.home() / "Applications" / "WezTerm.app" / "Contents" / "MacOS" / "wezterm",
+        ):
+            if path.exists():
+                return str(path)
+    return None
+
+
 def open_terminal_command(command: str, title: str = "codex-dash") -> int:
     system = platform.system().lower()
+    wezterm = wezterm_executable()
+    if wezterm:
+        args = [wezterm, "start", "--cwd", str(Path.home()), "--", "sh", "-lc", command]
+        if system == "windows":
+            args = [wezterm, "start", "--", "powershell", "-NoExit", "-Command", command]
+        return subprocess.Popen(args).returncode or 0
     if system == "windows":
         wt = shutil.which("wt.exe") if "shutil" in globals() else None
         if wt:
@@ -4557,16 +5422,41 @@ def open_session_terminal(session: dict[str, Any]) -> tuple[bool, str]:
     return True, f"{label}: {short_title(title, 60)}"
 
 
-def open_new_session_terminal(cwd: str | None = None) -> tuple[bool, str]:
+def open_new_session_terminal(
+    cwd: str | None = None,
+    project_id: str = "",
+    project_name: str = "",
+    subproject_id: str = "default",
+    remote_target: str = "",
+) -> tuple[bool, str]:
     workdir = cwd or os.getcwd()
-    command = f"codex --cd {shell_quote(workdir)}"
+    project_id = slugify(project_id)
+    if remote_target:
+        remote_shell = remote_shell_for_target(remote_target)
+        remote_command, tmux_name = remote_mux_codex_command(workdir, project_id, remote_shell)
+        if project_id:
+            add_pending_launch_assignment(workdir, project_id, subproject_id, remote_target, project_name or project_id)
+        remote_invocation = remote_command
+        command = f"ssh -t {shell_quote(remote_target)} {posix_shell_quote(remote_invocation)}"
+        title = f"{tmux_name} on {remote_target}"
+    else:
+        launch_parts = [sys.executable, str(Path(__file__).resolve()), "launch"]
+        if project_id:
+            launch_parts.extend(["--project-id", project_id, "--project-name", project_name or project_id, "--subproject-id", subproject_id or "default"])
+            add_pending_launch_assignment(workdir, project_id, subproject_id, machine_id(), project_name or project_id)
+        launch_parts.extend(["--", "codex", "--cd", workdir])
+        command = " ".join(shell_quote(part) for part in launch_parts)
+        title = "new codex session"
     try:
-        code = open_terminal_command(command, "new codex session")
+        code = open_terminal_command(command, title)
     except Exception as exc:
         return False, str(exc)
     if code not in (0, None):
         return False, f"terminal command exited with {code}"
-    return True, f"opened new session: {short_title(workdir, 60)}"
+    assignment = f" → {project_id}" if project_id else ""
+    location = f"{remote_target}:{workdir}" if remote_target else workdir
+    persistence = f" tmux:{tmux_name}" if remote_target else ""
+    return True, f"opened new session: {short_title(location, 60)}{assignment}{persistence}"
 
 
 def remove_session_from_exports(session_id: str) -> int:
@@ -4587,12 +5477,96 @@ def remove_session_from_exports(session_id: str) -> int:
     return removed
 
 
-def soft_delete_session(session_id: str, reason: str = "hidden from dashboard") -> int:
+def bin_session_snapshot(session: dict[str, Any] | None) -> dict[str, Any]:
+    if not session:
+        return {}
+    keys = [
+        "id",
+        "machine_id",
+        "cwd",
+        "project_id",
+        "subproject_id",
+        "generated_title",
+        "summary",
+        "updated_at",
+        "total_tokens",
+        "launch_origin",
+        "origin_hint",
+    ]
+    return {key: session.get(key) for key in keys if session.get(key) not in (None, "")}
+
+
+def soft_delete_session(session_id: str, reason: str = "hidden from dashboard", session: dict[str, Any] | None = None) -> int:
     data = load_deleted_sessions()
     sessions = data.setdefault("sessions", {})
-    sessions[session_id] = {"deleted_at": now_utc(), "reason": reason}
+    existing = sessions.get(session_id) if isinstance(sessions.get(session_id), dict) else {}
+    sessions[session_id] = {
+        **existing,
+        "deleted_at": now_utc(),
+        "reason": reason,
+        "snapshot": bin_session_snapshot(session) or existing.get("snapshot", {}),
+    }
     save_deleted_sessions(data)
     return remove_session_from_exports(session_id)
+
+
+def restore_deleted_session(session_id: str) -> bool:
+    data = load_deleted_sessions()
+    sessions = data.setdefault("sessions", {})
+    matches = [key for key, record in sessions.items() if str(key).startswith(session_id) and not (isinstance(record, dict) and record.get("purged_at"))]
+    if not matches:
+        return False
+    if len(matches) > 1:
+        raise SystemExit(f"Ambiguous bin session prefix: {session_id}")
+    del sessions[matches[0]]
+    save_deleted_sessions(data)
+    return True
+
+
+def permanently_delete_bin_session(session_id: str) -> bool:
+    data = load_deleted_sessions()
+    sessions = data.setdefault("sessions", {})
+    matches = [key for key, record in sessions.items() if str(key).startswith(session_id) and not (isinstance(record, dict) and record.get("purged_at"))]
+    if not matches:
+        return False
+    if len(matches) > 1:
+        raise SystemExit(f"Ambiguous bin session prefix: {session_id}")
+    record = sessions.get(matches[0])
+    if not isinstance(record, dict):
+        record = {}
+    record["purged_at"] = now_utc()
+    record["purged_reason"] = "permanently removed from bin"
+    sessions[matches[0]] = record
+    save_deleted_sessions(data)
+    return True
+
+
+def empty_bin_permanently() -> int:
+    data = load_deleted_sessions()
+    sessions = data.setdefault("sessions", {})
+    count = 0
+    for session_id, record in list(sessions.items()):
+        if isinstance(record, dict) and record.get("purged_at"):
+            continue
+        if not isinstance(record, dict):
+            record = {}
+        record["purged_at"] = now_utc()
+        record["purged_reason"] = "bin emptied"
+        sessions[session_id] = record
+        count += 1
+    save_deleted_sessions(data)
+    return count
+
+
+def bin_rows() -> list[tuple[str, dict[str, Any]]]:
+    sessions = load_deleted_sessions().get("sessions", {})
+    rows = [
+        (str(session_id), record if isinstance(record, dict) else {})
+        for session_id, record in sessions.items()
+        if not (isinstance(record, dict) and record.get("purged_at"))
+    ]
+    rows.sort(key=lambda item: str(item[1].get("deleted_at") or ""), reverse=True)
+    return rows
 
 
 def command_open_session(args: argparse.Namespace) -> None:
@@ -4603,7 +5577,13 @@ def command_open_session(args: argparse.Namespace) -> None:
 
 
 def command_new_session(args: argparse.Namespace) -> None:
-    ok, message = open_new_session_terminal(getattr(args, "cwd", "") or None)
+    ok, message = open_new_session_terminal(
+        getattr(args, "cwd", "") or None,
+        getattr(args, "project_id", "") or "",
+        getattr(args, "project_name", "") or "",
+        getattr(args, "subproject_id", "default") or "default",
+        getattr(args, "remote", "") or "",
+    )
     print(message)
     raise SystemExit(0 if ok else 1)
 
@@ -4611,8 +5591,52 @@ def command_new_session(args: argparse.Namespace) -> None:
 def command_delete_session(args: argparse.Namespace) -> None:
     target = find_session_by_prefix(args.session_id)
     session_id = str(target.get("id") or args.session_id)
-    removed = soft_delete_session(session_id, getattr(args, "reason", "") or "hidden from dashboard")
-    print(f"Hidden {session_id} from codex-dash ({removed} exported row(s) removed).")
+    removed = soft_delete_session(session_id, getattr(args, "reason", "") or "moved to bin", target)
+    print(f"Moved {session_id} to codex-dash bin ({removed} exported row(s) removed).")
+
+
+def command_bin(args: argparse.Namespace) -> None:
+    action = getattr(args, "bin_command", "list") or "list"
+    if action == "list":
+        rows = bin_rows()
+        if not rows:
+            print("Bin is empty.")
+            return
+        print(f"{'deleted':16} {'machine':14} {'project':24} {'id':36} title")
+        for session_id, record in rows:
+            snapshot = record.get("snapshot") if isinstance(record.get("snapshot"), dict) else {}
+            title = snapshot.get("generated_title") or snapshot.get("summary") or session_id
+            project = f"{snapshot.get('project_id', '')}/{snapshot.get('subproject_id', '')}".strip("/")
+            deleted_at = parse_timestamp_epoch(str(record.get("deleted_at") or ""))
+            print(f"{format_ts(deleted_at):16} {str(snapshot.get('machine_id') or '')[:14]:14} {project[:24]:24} {session_id[:36]:36} {short_title(str(title), 80)}")
+        return
+    if action == "restore":
+        restored = restore_deleted_session(args.session_id)
+        if not restored:
+            raise SystemExit(f"Session not found in bin: {args.session_id}")
+        refresh_export_quiet(int(getattr(args, "limit", 500) or 500))
+        print(f"Restored {args.session_id} from bin.")
+        return
+    if action == "empty":
+        count = empty_bin_permanently()
+        print(f"Permanently removed {count} session(s) from bin.")
+        return
+    if action in {"delete", "purge"}:
+        deleted = permanently_delete_bin_session(args.session_id)
+        if not deleted:
+            raise SystemExit(f"Session not found in bin: {args.session_id}")
+        print(f"Permanently removed {args.session_id} from bin.")
+        return
+    if action == "sweep-stale":
+        stale = [session for session in all_sessions() if session_lifecycle(session, machine_freshness()) == "stale"]
+        removed = 0
+        for session in stale:
+            session_id = str(session.get("id") or "")
+            if session_id:
+                removed += soft_delete_session(session_id, "stale session swept to bin", session)
+        print(f"Moved {len(stale)} stale session(s) to bin ({removed} exported row(s) removed).")
+        return
+    raise SystemExit("Missing bin command. Use: codex-dash bin list|restore|delete|empty|sweep-stale")
 
 
 def command_attach(args: argparse.Namespace) -> None:
@@ -4630,10 +5654,15 @@ def command_resume(args: argparse.Namespace) -> None:
     target = find_session_by_prefix(args.session_id)
 
     cwd = target.get("cwd") or str(Path.home())
-    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
-    codex_cmd = f"codex resume --cd {json.dumps(cwd)} {json.dumps(target['id'])}"
-    print(f"Running: {codex_cmd}")
-    raise SystemExit(subprocess.run(cmd + [codex_cmd]).returncode)
+    if platform.system().lower() == "windows":
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+        codex_cmd = f"codex resume --cd {json.dumps(cwd)} {json.dumps(target['id'])}"
+        print(f"Running: {codex_cmd}")
+        raise SystemExit(subprocess.run(cmd + [codex_cmd]).returncode)
+
+    cmd = ["codex", "resume", "--cd", cwd, str(target["id"])]
+    print(f"Running: {' '.join(cmd)}")
+    raise SystemExit(subprocess.run(cmd).returncode)
 
 
 def newest_thread_after(known_ids: set[str], started_at: int) -> dict[str, Any] | None:
@@ -4695,6 +5724,14 @@ def command_launch(args: argparse.Namespace) -> None:
             if thread:
                 try:
                     recorded = record_launch_metadata(thread, metadata, command)
+                    project_id = str(getattr(args, "project_id", "") or "")
+                    if project_id:
+                        assign_session_id_to_project(
+                            str(thread["id"]),
+                            project_id,
+                            str(getattr(args, "subproject_id", "default") or "default"),
+                            str(getattr(args, "project_name", "") or project_id),
+                        )
                 except Exception as exc:
                     print(f"Warning: could not record launch metadata: {exc}", file=sys.stderr, flush=True)
                     recorded = True
@@ -4704,6 +5741,14 @@ def command_launch(args: argparse.Namespace) -> None:
         if thread:
             try:
                 record_launch_metadata(thread, metadata, command)
+                project_id = str(getattr(args, "project_id", "") or "")
+                if project_id:
+                    assign_session_id_to_project(
+                        str(thread["id"]),
+                        project_id,
+                        str(getattr(args, "subproject_id", "default") or "default"),
+                        str(getattr(args, "project_name", "") or project_id),
+                    )
             except Exception as exc:
                 print(f"Warning: could not record launch metadata: {exc}", file=sys.stderr, flush=True)
     raise SystemExit(process.returncode)
@@ -4736,6 +5781,7 @@ def command_watch(args: argparse.Namespace) -> None:
             direction=getattr(args, "direction", "both"),
             remote_board_path=getattr(args, "remote_board_path", "~/.codex/instance-board"),
             remote_codex_home=getattr(args, "remote_codex_home", ""),
+            remote_shell=getattr(args, "remote_shell", "powershell"),
             local_board_path=getattr(args, "local_board_path", ""),
             local_codex_home=getattr(args, "local_codex_home", ""),
             skip_local_refresh=True,
@@ -4884,18 +5930,20 @@ def render_usage_columns(title: str, left_rows: list[str], right_rows: list[str]
     return render_usage_card(title, rows, width)
 
 
-def usage_value_row(label: str, value: str, detail: str = "") -> str:
-    text = f"{label:<14.14} {value:>8}"
-    if detail:
-        text += f" {detail}"
-    return text
+def usage_value_row(label: str, value: str, detail: str = "", width: int = 32) -> str:
+    label_width = min(18, max(10, width // 3))
+    suffix = f" {detail}" if detail else ""
+    value_text = str(value)
+    gap = max(1, width - label_width - len(value_text) - len(suffix))
+    return f"{label:<{label_width}.{label_width}}" + (" " * gap) + value_text + suffix
 
 
-def usage_plain_row(label: str, value: str, detail: str = "") -> str:
-    text = f"{label:<22.22} {value:>8}"
-    if detail:
-        text += f" {detail}"
-    return text
+def usage_plain_row(label: str, value: str, detail: str = "", width: int = 32) -> str:
+    label_width = min(24, max(12, width // 2))
+    suffix = f" {detail}" if detail else ""
+    value_text = str(value)
+    gap = max(1, width - label_width - len(value_text) - len(suffix))
+    return f"{label:<{label_width}.{label_width}}" + (" " * gap) + value_text + suffix
 
 
 def pad_usage_rows(rows: list[str], count: int) -> list[str]:
@@ -5008,6 +6056,10 @@ def read_local_log_stats() -> dict[str, Any]:
 
 def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 74) -> dict[str, Any]:
     width = max(44, min(140, width))
+    paired_card_width = max(24, (width - 2) // 2)
+    paired_inner_width = max(20, paired_card_width - 4)
+    full_inner_width = max(20, width - 4)
+    card_inner_width = paired_inner_width if width >= 88 else full_inner_width
     now = dt.datetime.now().astimezone()
     today_start = start_of_day(now)
     week_start = today_start - dt.timedelta(days=today_start.weekday())
@@ -5021,8 +6073,8 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
         totals = session_token_totals(sessions, start_time)
         period_cards.append(
             [
-                f"󰓅 {label:<11} {format_metric(totals['total_tokens'])}",
-                f"  {int(totals['active_sessions'])}/{int(totals['sessions'])} sessions  ctx {totals['avg_context_used_percent']:.1f}%",
+                usage_plain_row(f"󰓅 {label}", format_metric(totals["total_tokens"]), width=paired_inner_width),
+                usage_plain_row("  sessions", f"{int(totals['active_sessions'])}/{int(totals['sessions'])}", detail=f"ctx {totals['avg_context_used_percent']:.1f}%", width=paired_inner_width),
             ]
         )
         period_json.append({"label": label, **totals})
@@ -5067,29 +6119,29 @@ def build_usage_dashboard(top: int = 8, show_errors: bool = False, width: int = 
     period_left = [row for card in period_cards[0::2] for row in card]
     period_right = [row for card in period_cards[1::2] for row in card]
     token_left = [
-        usage_value_row("󰋊 Input", format_metric(all_totals["input_tokens"])),
-        usage_value_row("󰄬 Cached", format_metric(all_totals["cached_input_tokens"]), detail=f"{cache_ratio:.1f}% of input"),
-        usage_value_row("󰈸 Output", format_metric(all_totals["output_tokens"])),
+        usage_value_row("󰋊 Input", format_metric(all_totals["input_tokens"]), width=paired_inner_width),
+        usage_value_row("󰄬 Cached", format_metric(all_totals["cached_input_tokens"]), detail=f"{cache_ratio:.1f}% of input", width=paired_inner_width),
+        usage_value_row("󰈸 Output", format_metric(all_totals["output_tokens"]), width=paired_inner_width),
     ]
     token_right = [
-        usage_value_row("󰅟 Reasoning", format_metric(all_totals["reasoning_output_tokens"]), detail=f"{reasoning_ratio:.1f}% of output"),
-        usage_value_row("󰓅 Last turn", format_metric(all_totals["last_tokens"])),
-        f"󰹾 Indexed      {int(all_totals['active_sessions'])}/{int(all_totals['sessions'])} sessions",
+        usage_value_row("󰅟 Reasoning", format_metric(all_totals["reasoning_output_tokens"]), detail=f"{reasoning_ratio:.1f}% of output", width=paired_inner_width),
+        usage_value_row("󰓅 Last turn", format_metric(all_totals["last_tokens"]), width=paired_inner_width),
+        usage_plain_row("󰹾 Indexed", f"{int(all_totals['active_sessions'])}/{int(all_totals['sessions'])}", detail="sessions", width=paired_inner_width),
     ]
-    model_rows = [usage_value_row(f"󰚩 {label:<10}"[:14], format_metric(value)) for label, value in top_models[:top]]
-    machine_rows = [usage_plain_row(f"{machine_icon(label)} {label}"[:22], format_metric(value)) for label, value in top_machines[:5]]
-    project_rows = [usage_plain_row(f"󰏗 {label}"[:22], format_metric(value)) for label, value in top_projects[:5]]
-    session_rows = [usage_plain_row(f"󰈙 {label}"[:22], value) for label, value in top_sessions[:5]]
+    model_rows = [usage_value_row(f"󰚩 {label:<10}"[:14], format_metric(value), width=paired_inner_width) for label, value in top_models[:top]]
+    machine_rows = [usage_plain_row(f"{machine_icon(label)} {label}"[:22], format_metric(value), width=card_inner_width) for label, value in top_machines[:5]]
+    project_rows = [usage_plain_row(f"󰏗 {label}"[:22], format_metric(value), width=card_inner_width) for label, value in top_projects[:5]]
+    session_rows = [usage_plain_row(f"󰈙 {label}"[:22], value, width=card_inner_width) for label, value in top_sessions[:5]]
     machine_total = len({str(session.get("machine_id") or "unknown") for session in sessions})
     machine_summary_rows = [
-        usage_plain_row(" Machines", str(machine_total)),
-        usage_plain_row("󰈙 Sessions", str(len(sessions))),
+        usage_plain_row(" Machines", str(machine_total), width=card_inner_width),
+        usage_plain_row("󰈙 Sessions", str(len(sessions)), width=card_inner_width),
         *pad_usage_rows(machine_rows, 3),
     ]
     account_label = current_account_label(machine_freshness())
     local_summary_rows = [
-        usage_plain_row(f"{machine_icon(machine_id())} Local machine", machine_id(), machine_kind_label(machine_id())),
-        usage_plain_row("󰀄 Account", account_label),
+        usage_plain_row(f"{machine_icon(machine_id())} Local machine", machine_id(), machine_kind_label(machine_id()), width=card_inner_width),
+        usage_plain_row("󰀄 Account", account_label, width=card_inner_width),
         f"󰋊 {CODEX_HOME}",
         f"󰉋 {BOARD_HOME}",
         f"Updated: {now.strftime('%Y-%m-%d %H:%M %Z')}",
@@ -5231,6 +6283,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     new = sub.add_parser("new", help="Open a new Codex session in a terminal")
     new.add_argument("--cwd", default="", help="Working directory for the new Codex session")
+    new.add_argument("--project-id", default="", help="Assign the newly launched session to this project")
+    new.add_argument("--project-name", default="", help="Display name when creating the project")
+    new.add_argument("--subproject-id", default="default", help="Subproject id for the new assignment")
+    new.add_argument("--remote", default="", help="SSH target when the working directory is on a remote machine")
     new.set_defaults(func=command_new_session)
 
     resume = sub.add_parser("resume", help="Resume a session by full id or unique prefix")
@@ -5246,6 +6302,26 @@ def build_parser() -> argparse.ArgumentParser:
     delete.add_argument("--reason", default="")
     delete.set_defaults(func=command_delete_session)
 
+    bin_cmd = sub.add_parser("bin", help="List, restore, permanently delete, empty, or sweep binned sessions")
+    bin_sub = bin_cmd.add_subparsers(dest="bin_command")
+    bin_cmd.set_defaults(func=command_bin, bin_command="list")
+    bin_list = bin_sub.add_parser("list", help="List sessions in the bin")
+    bin_list.set_defaults(func=command_bin)
+    bin_restore = bin_sub.add_parser("restore", help="Restore a session from the bin")
+    bin_restore.add_argument("session_id", help="Full session id or unique prefix")
+    bin_restore.add_argument("--limit", type=int, default=500, help="Refresh limit after restore")
+    bin_restore.set_defaults(func=command_bin)
+    bin_delete = bin_sub.add_parser("delete", help="Permanently remove one session from the bin")
+    bin_delete.add_argument("session_id", help="Full session id or unique prefix")
+    bin_delete.set_defaults(func=command_bin)
+    bin_purge = bin_sub.add_parser("purge", help="Alias for delete")
+    bin_purge.add_argument("session_id", help="Full session id or unique prefix")
+    bin_purge.set_defaults(func=command_bin)
+    bin_empty = bin_sub.add_parser("empty", help="Permanently remove all visible bin records")
+    bin_empty.set_defaults(func=command_bin)
+    bin_sweep = bin_sub.add_parser("sweep-stale", help="Move all currently stale sessions to the bin")
+    bin_sweep.set_defaults(func=command_bin)
+
     attach = sub.add_parser("attach", help="Run the recorded attach command for a tmux/SSH session")
     attach.add_argument("session_id")
     attach.set_defaults(func=command_attach)
@@ -5255,6 +6331,9 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--origin-hint", default="", help="Machine, SSH client, or other source label")
     launch.add_argument("--tmux-session", default="", help="tmux session/window/pane label to show in the dashboard")
     launch.add_argument("--attach-command", default="", help="Command used later by `codex-dash attach` or TUI key `o`")
+    launch.add_argument("--project-id", default="", help="Assign the detected launched session to this project")
+    launch.add_argument("--project-name", default="", help="Display name when creating the project")
+    launch.add_argument("--subproject-id", default="default", help="Subproject id for launch assignment")
     launch.add_argument("command", nargs=argparse.REMAINDER, help="Command to run, usually after --")
     launch.set_defaults(func=command_launch)
 
@@ -5263,6 +6342,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--direction", choices=["push", "pull", "both"], default="both")
     sync.add_argument("--remote-board-path", default="~/.codex/instance-board")
     sync.add_argument("--remote-codex-home", default="", help="CODEX_HOME to use during remote refresh")
+    sync.add_argument("--remote-shell", choices=["powershell", "sh"], default="powershell", help="Remote shell used over SSH")
     sync.add_argument("--local-board-path", default="", help="Local board path to read/write during sync")
     sync.add_argument("--local-codex-home", default="", help="Local CODEX_HOME to use during sync refresh")
     sync.add_argument("--skip-local-refresh", action="store_true")
@@ -5281,6 +6361,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--direction", choices=["push", "pull", "both"], default="both")
     watch.add_argument("--remote-board-path", default="~/.codex/instance-board")
     watch.add_argument("--remote-codex-home", default="", help="CODEX_HOME to use during remote refresh")
+    watch.add_argument("--remote-shell", choices=["powershell", "sh"], default="powershell", help="Remote shell used over SSH")
     watch.add_argument("--local-board-path", default="", help="Local board path to read/write during sync")
     watch.add_argument("--local-codex-home", default="", help="Local CODEX_HOME to use during sync refresh")
     watch.add_argument("--skip-remote-refresh", action="store_true")
